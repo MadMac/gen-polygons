@@ -13,9 +13,10 @@ winit = "0.22"
 cgmath = "0.17"
 env_logger = "0.7"
 log = "0.4"
-wgpu = "0.7"
+wgpu = "0.8.1"
 futures = "0.3"
 oxigen = "2.2.2"
+bytemuck = { version = "1.4", features = [ "derive" ] }
 
 [build-dependencies]
 anyhow = "1.0"
