@@ -1,4 +1,5 @@
 use std::iter;
+use rand::prelude::*;
 
 use winit::{
     event::*,
@@ -19,6 +20,7 @@ struct State {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
+    vertices: Vec<Vertex>
 }
 
 #[repr(C)]
@@ -149,15 +151,18 @@ impl State {
             },
         });
 
+        let num_vertices = VERTICES.len() as u32;
+        let vertices = Vec::with_capacity(0);
+
         let vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(VERTICES),
+                contents: bytemuck::cast_slice(&vertices),
                 usage: wgpu::BufferUsage::VERTEX,
             }
         );
 
-        let num_vertices = VERTICES.len() as u32;
+        
 
         Self {
             surface,
@@ -171,7 +176,8 @@ impl State {
             size,
             render_pipeline,
             vertex_buffer,
-            num_vertices
+            num_vertices,
+            vertices
         }
     }
 
@@ -236,7 +242,7 @@ fn main() {
     env_logger::init();
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
-
+    let mut rng = thread_rng();
     use futures::executor::block_on;
 
     // Since main can't be async, we're going to need to block
@@ -287,5 +293,20 @@ fn main() {
             }
             _ => {}
         }
+        let amount_of_polygons = 20;
+        state.vertices = Vec::with_capacity(0);
+        for _n in 0..amount_of_polygons*3 {
+            let vertex = Vertex { position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)], color: [1.0, 0.0, 0.0] };
+            state.vertices.push(vertex);
+        }
+        state.vertex_buffer = state.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(&state.vertices),
+                usage: wgpu::BufferUsage::VERTEX,
+            }
+        );
+        state.num_vertices = state.vertices.len() as u32;
+       //println!("{:?}", state.vertices);
     });
 }

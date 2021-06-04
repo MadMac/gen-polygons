@@ -17,6 +17,7 @@ wgpu = "0.8.1"
 futures = "0.3"
 oxigen = "2.2.2"
 bytemuck = { version = "1.4", features = [ "derive" ] }
+rand = "0.8.0"
 
 [build-dependencies]
 anyhow = "1.0"
