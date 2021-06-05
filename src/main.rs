@@ -21,6 +21,7 @@ struct State {
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
     vertices: Vec<Vertex>,
+    smaa_target: smaa::SmaaTarget
 }
 
 #[repr(C)]
@@ -79,9 +80,11 @@ impl State {
             .await
             .unwrap();
 
+        let swapchain_format = adapter.get_swap_chain_preferred_format(&surface).unwrap();
+
         let sc_desc = wgpu::SwapChainDescriptor {
             usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
-            format: adapter.get_swap_chain_preferred_format(&surface).unwrap(),
+            format: swapchain_format,
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::Fifo,
@@ -160,6 +163,15 @@ impl State {
             usage: wgpu::BufferUsage::VERTEX,
         });
 
+        let smaa_target = smaa::SmaaTarget::new(
+            &device,
+            &queue,
+            window.inner_size().width,
+            window.inner_size().height,
+            swapchain_format,
+            smaa::SmaaMode::Smaa1X,
+        );
+
         Self {
             surface,
             device,
@@ -174,6 +186,7 @@ impl State {
             vertex_buffer,
             num_vertices,
             vertices,
+            smaa_target
         }
     }
 
@@ -191,7 +204,8 @@ impl State {
     fn update(&mut self) {}
 
     fn render(&mut self) -> Result<(), wgpu::SwapChainError> {
-        let frame = self.swap_chain.get_current_frame()?.output;
+        let output_frame = self.swap_chain.get_current_frame()?.output;
+        let frame = self.smaa_target.start_frame(&self.device, &self.queue, &output_frame.view);
 
         let mut encoder = self
             .device
@@ -203,7 +217,7 @@ impl State {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[wgpu::RenderPassColorAttachment {
-                    view: &frame.view,
+                    view: &frame,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.clear_color),
