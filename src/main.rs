@@ -1,5 +1,5 @@
-use std::iter;
 use rand::prelude::*;
+use std::iter;
 
 use winit::{
     event::*,
@@ -20,21 +20,15 @@ struct State {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
-    vertices: Vec<Vertex>
+    vertices: Vec<Vertex>,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
-    color: [f32; 3],
+    color: [f32; 4],
 }
-
-const VERTICES: &[Vertex] = &[
-    Vertex { position: [0.0, 0.5, 0.0], color: [1.0, 0.0, 0.0] },
-    Vertex { position: [-0.5, -0.5, 0.0], color: [0.0, 1.0, 0.0] },
-    Vertex { position: [0.5, -0.5, 0.0], color: [0.0, 0.0, 1.0] },
-];
 
 impl Vertex {
     fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
@@ -50,9 +44,9 @@ impl Vertex {
                 wgpu::VertexAttribute {
                     offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                     shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x3,
-                }
-            ]
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
         }
     }
 }
@@ -114,10 +108,8 @@ impl State {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "main", // 1.
-                buffers: &[
-                    Vertex::desc(),
-                ],        // 2.
+                entry_point: "main",        // 1.
+                buffers: &[Vertex::desc()], // 2.
             },
             fragment: Some(wgpu::FragmentState {
                 // 3.
@@ -127,8 +119,16 @@ impl State {
                     // 4.
                     format: sc_desc.format,
                     blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent::REPLACE,
-                        alpha: wgpu::BlendComponent::REPLACE,
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
                     }),
                     write_mask: wgpu::ColorWrite::ALL,
                 }],
@@ -141,28 +141,24 @@ impl State {
                 // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
                 polygon_mode: wgpu::PolygonMode::Fill,
                 clamp_depth: false,
-                conservative: false
+                conservative: false,
             },
             depth_stencil: None, // 1.
             multisample: wgpu::MultisampleState {
-                count: 1,                         // 2.
-                mask: !0,                         // 3.
-                alpha_to_coverage_enabled: false, // 4.
+                count: 1,                        // 2.
+                mask: !0,                        // 3.
+                alpha_to_coverage_enabled: true, // 4.
             },
         });
 
-        let num_vertices = VERTICES.len() as u32;
+        let num_vertices = 0;
         let vertices = Vec::with_capacity(0);
 
-        let vertex_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsage::VERTEX,
-            }
-        );
-
-        
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsage::VERTEX,
+        });
 
         Self {
             surface,
@@ -177,7 +173,7 @@ impl State {
             render_pipeline,
             vertex_buffer,
             num_vertices,
-            vertices
+            vertices,
         }
     }
 
@@ -192,9 +188,9 @@ impl State {
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 self.clear_color = wgpu::Color {
-                    r: position.x as f64 / self.size.width as f64,
-                    g: position.y as f64 / self.size.height as f64,
-                    b: 1.0,
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
                     a: 1.0,
                 };
                 true
@@ -248,6 +244,28 @@ fn main() {
     // Since main can't be async, we're going to need to block
     let mut state = block_on(State::new(&window));
 
+    let amount_of_polygons = 20;
+    state.vertices = Vec::with_capacity(0);
+    for _n in 0..amount_of_polygons * 3 {
+        let vertex = Vertex {
+            position: [
+                rng.gen_range(-1.0..1.0),
+                rng.gen_range(-1.0..1.0),
+                rng.gen_range(-1.0..1.0),
+            ],
+            color: [1.0, 0.0, 0.0, 0.2],
+        };
+        state.vertices.push(vertex);
+    }
+    state.vertex_buffer = state
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&state.vertices),
+            usage: wgpu::BufferUsage::VERTEX,
+        });
+    state.num_vertices = state.vertices.len() as u32;
+
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent {
@@ -293,20 +311,27 @@ fn main() {
             }
             _ => {}
         }
-        let amount_of_polygons = 20;
+        /* let amount_of_polygons = 20;
         state.vertices = Vec::with_capacity(0);
-        for _n in 0..amount_of_polygons*3 {
-            let vertex = Vertex { position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)], color: [1.0, 0.0, 0.0] };
+        for _n in 0..amount_of_polygons * 3 {
+            let vertex = Vertex {
+                position: [
+                    rng.gen_range(-1.0..1.0),
+                    rng.gen_range(-1.0..1.0),
+                    rng.gen_range(-1.0..1.0),
+                ],
+                color: [1.0, 0.0, 0.0],
+            };
             state.vertices.push(vertex);
         }
-        state.vertex_buffer = state.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
+        state.vertex_buffer = state
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Vertex Buffer"),
                 contents: bytemuck::cast_slice(&state.vertices),
                 usage: wgpu::BufferUsage::VERTEX,
-            }
-        );
-        state.num_vertices = state.vertices.len() as u32;
-       //println!("{:?}", state.vertices);
+            });
+        state.num_vertices = state.vertices.len() as u32;*/
+        //println!("{:?}", state.vertices);
     });
 }
