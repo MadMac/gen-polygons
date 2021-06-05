@@ -184,19 +184,8 @@ impl State {
         self.swap_chain = self.device.create_swap_chain(&self.surface, &self.sc_desc);
     }
 
-    fn input(&mut self, event: &WindowEvent) -> bool {
-        match event {
-            WindowEvent::CursorMoved { position, .. } => {
-                self.clear_color = wgpu::Color {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                };
-                true
-            }
-            _ => false,
-        }
+    fn input(&mut self, _event: &WindowEvent) -> bool {
+        false
     }
 
     fn update(&mut self) {}
@@ -244,28 +233,6 @@ fn main() {
     // Since main can't be async, we're going to need to block
     let mut state = block_on(State::new(&window));
 
-    let amount_of_polygons = 20;
-    state.vertices = Vec::with_capacity(0);
-    for _n in 0..amount_of_polygons * 3 {
-        let vertex = Vertex {
-            position: [
-                rng.gen_range(-1.0..1.0),
-                rng.gen_range(-1.0..1.0),
-                rng.gen_range(-1.0..1.0),
-            ],
-            color: [1.0, 0.0, 0.0, 0.2],
-        };
-        state.vertices.push(vertex);
-    }
-    state.vertex_buffer = state
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&state.vertices),
-            usage: wgpu::BufferUsage::VERTEX,
-        });
-    state.num_vertices = state.vertices.len() as u32;
-
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent {
@@ -311,7 +278,7 @@ fn main() {
             }
             _ => {}
         }
-        /* let amount_of_polygons = 20;
+        let amount_of_polygons = 200;
         state.vertices = Vec::with_capacity(0);
         for _n in 0..amount_of_polygons * 3 {
             let vertex = Vertex {
@@ -320,7 +287,7 @@ fn main() {
                     rng.gen_range(-1.0..1.0),
                     rng.gen_range(-1.0..1.0),
                 ],
-                color: [1.0, 0.0, 0.0],
+                color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
             };
             state.vertices.push(vertex);
         }
@@ -331,7 +298,7 @@ fn main() {
                 contents: bytemuck::cast_slice(&state.vertices),
                 usage: wgpu::BufferUsage::VERTEX,
             });
-        state.num_vertices = state.vertices.len() as u32;*/
+        state.num_vertices = state.vertices.len() as u32;
         //println!("{:?}", state.vertices);
     });
 }
