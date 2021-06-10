@@ -25,3 +25,11 @@ anyhow = "1.0"
 fs_extra = "1.1"
 glob = "0.3"
 shaderc = "0.7"
+
+[[bin]]
+name = "polygen"
+path = "src/polygen/main.rs"
+
+[[bin]]
+name = "genalgo"
+path = "src/genalgo/main.rs"
