@@ -297,8 +297,8 @@ fn main() {
         for _n in 0..amount_of_polygons * 3 {
             let vertex = Vertex {
                 position: [
-                    rng.gen_range(-1.0..1.0),
-                    rng.gen_range(-1.0..1.0),
+                    rng.gen_range(-1.0, 1.0),
+                    rng.gen_range(-1.0, 1.0),
                     0.0,
                 ],
                 color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
