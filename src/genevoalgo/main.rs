@@ -1,4 +1,4 @@
-use genevo::{population::*, random::Rng};
+use genevo::{population::*, prelude::FitnessFunction, random::Rng};
 
 const NUM_VERTICES: i16 = 20;
 const POPULATION_SIZE: usize = 100;
@@ -27,6 +27,27 @@ impl GenomeBuilder<Vertices> for Pictures {
 	}
 }
 
+#[derive(Clone, Debug)]
+struct FitnessCalc;
+
+impl FitnessFunction<Vertices, usize> for FitnessCalc {
+	fn fitness_of(&self, vertices: &Vertices) -> usize {
+		10
+	}
+
+	fn average(&self, values: &[usize]) -> usize {
+		(values.iter().sum::<usize>() as f32 / values.len() as f32 + 0.5).floor() as usize
+	}
+
+	fn highest_possible_fitness(&self) -> usize {
+		100
+	}
+
+	fn lowest_possible_fitness(&self) -> usize {
+		0
+	}
+}
+
 fn main() {
 	println!("Running genevoalgo");
 
@@ -37,6 +58,4 @@ fn main() {
 		.uniform_at_random();
 	println!("Initial population done");
 	// println!("{:?}", initial_population);
-
-	
 }
