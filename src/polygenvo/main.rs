@@ -1,3 +1,4 @@
+use genevo::{operator::prelude::*, population::*, prelude::*, random::Rng, types::fmt::Display};
 use rand::prelude::*;
 use std::iter;
 
@@ -8,6 +9,10 @@ use winit::{
 };
 
 use wgpu::util::DeviceExt;
+
+const NUM_VERTICES: i16 = 33;
+const POPULATION_SIZE: usize = 100;
+const GENERATION_LIMIT: u64 = 10000;
 
 struct State {
     surface: wgpu::Surface,
@@ -24,10 +29,28 @@ struct State {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable, PartialEq, PartialOrd)]
 struct Vertex {
     position: [f32; 3],
     color: [f32; 4],
+}
+
+type Vertices = Vec<Vertex>;
+
+struct Pictures;
+
+impl GenomeBuilder<Vertices> for Pictures {
+    fn build_genome<R>(&self, _: usize, rng: &mut R) -> Vertices
+    where
+        R: Rng + Sized,
+    {
+        (0..NUM_VERTICES)
+            .map(|_| Vertex {
+                position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0],
+                color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
+            })
+            .collect()
+    }
 }
 
 impl Vertex {
@@ -47,6 +70,73 @@ impl Vertex {
                     format: wgpu::VertexFormat::Float32x4,
                 },
             ],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FitnessCalc;
+
+impl FitnessFunction<Vertices, usize> for FitnessCalc {
+    fn fitness_of(&self, vertices: &Vertices) -> usize {
+        let mut result: f32 = 0.0;
+        //println!("{:?}", self.vertices);
+        for (_, ver_q) in vertices.iter().enumerate() {
+            //println!("Vertex:  {:?}", ver_q);
+            for i in 0..3 {
+                result += ver_q.position[i];
+            }
+
+            for i in 0..4 {
+                result += ver_q.color[i];
+            }
+        }
+
+        result as usize
+    }
+
+    fn average(&self, values: &[usize]) -> usize {
+        (values.iter().sum::<usize>() as f32 / values.len() as f32 + 0.5).floor() as usize
+    }
+
+    fn highest_possible_fitness(&self) -> usize {
+        240
+    }
+
+    fn lowest_possible_fitness(&self) -> usize {
+        0
+    }
+}
+
+impl BreederValueMutation for Vertex {
+    fn breeder_mutated(value: Self, range: &Vertex, adjustment: f64, sign: i8) -> Self {
+        // println!("{} {}", adjustment, sign);
+        Vertex {
+            position: [
+                value.position[0]
+                    + (range.position[0] as f32 * adjustment as f32 * sign as f32) as f32,
+                value.position[1]
+                    + (range.position[1] as f32 * adjustment as f32 * sign as f32) as f32,
+                0.0,
+            ],
+            color: [
+                value.color[0] + (range.color[0] * adjustment as f32 * sign as f32),
+                value.color[1] + (range.color[1] * adjustment as f32 * sign as f32),
+                value.color[2] + (range.color[2] * adjustment as f32 * sign as f32),
+                value.color[3] + (range.color[3] * adjustment as f32 * sign as f32),
+            ],
+        }
+    }
+}
+
+impl RandomValueMutation for Vertex {
+    fn random_mutated<R>(value: Self, min_value: &Vertex, max_value: &Self, rng: &mut R) -> Self
+    where
+        R: Rng + Sized,
+    {
+        Vertex {
+            position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0],
+            color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
         }
     }
 }
@@ -249,11 +339,53 @@ fn main() {
     env_logger::init();
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
-    let mut rng = thread_rng();
     use futures::executor::block_on;
 
     // Since main can't be async, we're going to need to block
     let mut state = block_on(State::new(&window));
+    let mut is_sim_running = true;
+    let mut current_result: Vec<Vertex> = Vec::with_capacity(0);
+
+    println!("Running genevoalgo");
+
+    println!("Making initial population");
+    let initial_population: Population<Vertices> = build_population()
+        .with_genome_builder(Pictures)
+        .of_size(POPULATION_SIZE)
+        .uniform_at_random();
+    println!("Initial population done");
+    println!("{:?}", initial_population);
+
+    let mut picture_sim = simulate(
+        genetic_algorithm()
+            .with_evaluation(FitnessCalc)
+            .with_selection(MaximizeSelector::new(0.7, 2))
+            .with_crossover(UniformCrossBreeder::new())
+            .with_mutation(BreederValueMutator::new(
+                0.5,
+                Vertex {
+                    position: [0.05, 0.05, 0.05],
+                    color: [0.05, 0.05, 0.05, 0.0],
+                },
+                3,
+                Vertex {
+                    position: [-1.0, -1.0, -1.0],
+                    color: [0.0, 0.0, 0.0, 0.0],
+                },
+                Vertex {
+                    position: [1.0, 1.0, 1.0],
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+            ))
+            .with_reinsertion(ElitistReinserter::new(FitnessCalc, false, 0.7))
+            .with_initial_population(initial_population)
+            .build(),
+    )
+    .until(or(
+        FitnessLimit::new(FitnessCalc.highest_possible_fitness()),
+        GenerationLimit::new(GENERATION_LIMIT),
+    ))
+    .build();
 
     event_loop.run(move |event, _, control_flow| {
         match event {
@@ -283,7 +415,7 @@ fn main() {
                     }
                 }
             }
-            Event::RedrawRequested(window_id) if window_id == window.id() => {
+            Event::RedrawRequested(_) => {
                 state.update();
                 match state.render() {
                     Ok(_) => {}
@@ -300,19 +432,59 @@ fn main() {
             }
             _ => {}
         }
-        let amount_of_polygons = 10;
+        let amount_of_polygons = 100;
         state.vertices = Vec::with_capacity(0);
-        for _n in 0..amount_of_polygons * 3 {
-            let vertex = Vertex {
-                position: [
-                    rng.gen_range(-1.0..1.0),
-                    rng.gen_range(-1.0..1.0),
-                    0.0,
-                ],
-                color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
-            };
-            state.vertices.push(vertex);
+
+        if is_sim_running {
+            let result = picture_sim.step();
+            match result {
+                Ok(SimResult::Intermediate(step)) => {
+                    let evaluated_population = step.result.evaluated_population;
+                    let best_solution = step.result.best_solution;
+                    println!(
+                        "Step: generation: {}, average_fitness: {}, \
+                     best fitness: {}, duration: {}, processing_time: {}",
+                        step.iteration,
+                        evaluated_population.average_fitness(),
+                        best_solution.solution.fitness,
+                        step.duration.fmt(),
+                        step.processing_time.fmt()
+                    );
+                    current_result = best_solution.solution.genome;
+                    // println!("      {:?}", best_solution.solution.genome);
+                    //                println!("| population: [{}]", result.population.iter().map(|g| g.as_text())
+                    //                    .collect::<Vec<String>>().join("], ["));
+                }
+                Ok(SimResult::Final(step, processing_time, duration, stop_reason)) => {
+                    let best_solution = step.result.best_solution;
+                    println!("{}", stop_reason);
+                    println!(
+                        "Final result after {}: generation: {}, \
+                     best solution with fitness {} found in generation {}, processing_time: {}",
+                        duration.fmt(),
+                        step.iteration,
+                        best_solution.solution.fitness,
+                        best_solution.generation,
+                        processing_time.fmt()
+                    );
+                    is_sim_running = false;
+                    println!("Best solution:     {:?}", best_solution.solution.genome);
+                    current_result = best_solution.solution.genome;
+                }
+                Err(error) => {
+                    println!("{}", error);
+                    is_sim_running = false;
+                }
+            }
         }
+        state.vertices = current_result.to_owned();
+        // for _n in 0..amount_of_polygons * 3 {
+        //     let vertex = Vertex {
+        //         position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0],
+        //         color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
+        //     };
+        //     state.vertices.push(vertex);
+        // }
         state.vertex_buffer = state
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {

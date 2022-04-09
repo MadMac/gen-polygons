@@ -11,14 +11,14 @@ image = "0.23"
 winit = "0.26.1"
 #shaderc = "0.7"
 cgmath = "0.17"
-env_logger = "0.7"
+env_logger = "0.9"
 log = "0.4"
-wgpu = "0.8.1"
+wgpu = "0.12.0"
 futures = "0.3"
 oxigen = "2.2.2"
 bytemuck = { version = "1.4", features = [ "derive" ] }
-rand = "0.7.0"
-smaa = "0.3.0"
+rand = "0.8.5"
+smaa = "0.6.0"
 genevo = "0.7"
 
 [build-dependencies]
@@ -38,3 +38,7 @@ path = "src/genalgo/main.rs"
 [[bin]]
 name = "genevoalgo"
 path = "src/genevoalgo/main.rs"
+
+[[bin]]
+name = "polygenvo"
+path = "src/polygenvo/main.rs"
