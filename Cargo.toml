@@ -9,11 +9,11 @@ edition = "2021"
 [dependencies]
 image = "0.23"
 winit = "0.26.1"
-#shaderc = "0.7"
+shaderc = "0.7"
 cgmath = "0.17"
 env_logger = "0.9"
 log = "0.4"
-wgpu = "0.12.0"
+wgpu = { version = "0.12.0", features = [ "spirv" ] }
 futures = "0.3"
 oxigen = "2.2.2"
 bytemuck = { version = "1.4", features = [ "derive" ] }
