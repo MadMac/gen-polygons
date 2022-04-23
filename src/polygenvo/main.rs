@@ -3,6 +3,10 @@ use rand::prelude::*;
 use std::iter;
 use std::num::NonZeroU32;
 use futures::executor::block_on;
+use dssim::*;
+use std::path::Path;
+use rgb::*;
+use std::fmt;
 
 use winit::{
     event::*,
@@ -13,7 +17,7 @@ use winit::{
 use wgpu::util::DeviceExt;
 
 const NUM_VERTICES: i16 = 33;
-const POPULATION_SIZE: usize = 6;
+const POPULATION_SIZE: usize = 30;
 const GENERATION_LIMIT: u64 = 10000;
 
 #[derive(Debug)]
@@ -75,10 +79,29 @@ impl Vertex {
             ],
         }
     }
-} 
+}
+
+struct GoalImage {
+    goal_image: DssimImage<f32>
+}
+
+impl Clone for GoalImage {
+    fn clone(&self) -> GoalImage {
+        GoalImage{
+            goal_image: self.goal_image.clone()
+        }
+    }
+}
+
+impl fmt::Debug for GoalImage {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Empty debug")
+    }
+}
 
 #[derive(Clone, Debug)]
 struct FitnessCalc{
+    goal_image: GoalImage,
 }
 
 impl FitnessFunction<Vertices, usize> for FitnessCalc {
@@ -236,6 +259,8 @@ impl FitnessFunction<Vertices, usize> for FitnessCalc {
 
         queue.submit(Some(encoder.finish()));
 
+        let mut fitness_result: usize = 0;
+
         // We need to scope the mapping variables so that we can
         // unmap the buffer
         {
@@ -247,33 +272,46 @@ impl FitnessFunction<Vertices, usize> for FitnessCalc {
             device.poll(wgpu::Maintain::Wait);
             block_on(mapping).unwrap();
 
+            
             let data = buffer_slice.get_mapped_range();
             use image::{ImageBuffer, Rgba};
+            let dssim = Dssim::new();
             let buffer =
                 ImageBuffer::<Rgba<u8>, _>::from_raw(texture_size, texture_size, data).unwrap();
-            // let mut rng = thread_rng();
-            // let id: u32 = rng.gen_range(0..100);
-            // buffer.save(String::from("triangles/image") + &id.to_string() + ".png").unwrap();
+            // let elapsed = now.elapsed();
+            // println!("Elapsed 1: {:.2?}", elapsed);
+            
+            
+            let gen_image = dssim.create_image_rgba(buffer.as_ref().as_rgba(), 512, 512).unwrap();
+            // let elapsed = now.elapsed();
+            // println!("Elapsed 2: {:.2?}", elapsed);
+            // let modified_image = load_image(&dssim, Path::new("goal.png")).unwrap();
+            let comparison_result = dssim.compare(&self.goal_image.goal_image, &gen_image);
+            fitness_result = (comparison_result.0 / (1.0 + comparison_result.0) * 10000.0) as usize;
+            // println!("DSSIM: {:?}", fitness_result);
+            let mut rng = thread_rng();
+            let id: u32 = rng.gen_range(0..100);
+            buffer.save(String::from("triangles/image") + &id.to_string() + ".png").unwrap();
         }
         output_buffer.unmap();
 
-        let mut result: f32 = 0.0;
-        //println!("{:?}", self.vertices);
-        for (_, ver_q) in vertices.iter().enumerate() {
-            //println!("Vertex:  {:?}", ver_q);
-            for i in 0..3 {
-                result += ver_q.position[i];
-            }
+        // let mut result: f32 = 0.0;
+        // //println!("{:?}", self.vertices);
+        // for (_, ver_q) in vertices.iter().enumerate() {
+        //     //println!("Vertex:  {:?}", ver_q);
+        //     for i in 0..3 {
+        //         result += ver_q.position[i];
+        //     }
 
-            for i in 0..4 {
-                result += ver_q.color[i];
-            }
-        }
+        //     for i in 0..4 {
+        //         result += ver_q.color[i];
+        //     }
+        // }
 
-        let elapsed = now.elapsed();
-        println!("Elapsed: {:.2?}", elapsed);
+        // let elapsed = now.elapsed();
+        // println!("Elapsed 3: {:.2?}", elapsed);
 
-        result as usize
+        fitness_result
     }
 
     fn average(&self, values: &[usize]) -> usize {
@@ -281,7 +319,7 @@ impl FitnessFunction<Vertices, usize> for FitnessCalc {
     }
 
     fn highest_possible_fitness(&self) -> usize {
-        240
+        10000
     }
 
     fn lowest_possible_fitness(&self) -> usize {
@@ -291,7 +329,7 @@ impl FitnessFunction<Vertices, usize> for FitnessCalc {
 
 impl BreederValueMutation for Vertex {
     fn breeder_mutated(value: Self, range: &Vertex, adjustment: f64, sign: i8) -> Self {
-        // println!("{} {}", adjustment, sign);
+        // println!("{}", (range.position[0] as f32 * adjustment as f32 * sign as f32));
         Vertex {
             position: [
                 value.position[0]
@@ -566,13 +604,13 @@ async fn save_buffer(vertex_buffer: &wgpu::Buffer, device: &wgpu::Device, config
 fn main() {
     env_logger::init();
     let event_loop = EventLoop::new();
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
-    window.set_inner_size(winit::dpi::LogicalSize::new(512.0, 512.0));
-    window.set_resizable(false);
+    // let window = WindowBuilder::new().build(&event_loop).unwrap();
+    // window.set_inner_size(winit::dpi::LogicalSize::new(512.0, 512.0));
+    // window.set_resizable(false);
 
 
     // Since main can't be async, we're going to need to block
-    let mut state = block_on(State::new(&window));
+    // let mut state = block_on(State::new(&window));
     let mut is_sim_running = true;
     let mut current_result: Vec<Vertex> = Vec::with_capacity(0);
 
@@ -586,16 +624,22 @@ fn main() {
     println!("Initial population done");
     println!("{:?}", initial_population);
 
+    let dssim = Dssim::new();
+    let goal_image_image = load_image(&dssim, Path::new("goal.png")).unwrap();
+    let goal_image = GoalImage{
+        goal_image: goal_image_image
+    };
+
     let mut picture_sim = simulate(
         genetic_algorithm()
-            .with_evaluation(FitnessCalc{})
+            .with_evaluation(FitnessCalc{goal_image: goal_image.clone()})
             .with_selection(MaximizeSelector::new(0.7, 2))
             .with_crossover(UniformCrossBreeder::new())
             .with_mutation(BreederValueMutator::new(
-                0.5,
+                0.3,
                 Vertex {
-                    position: [0.05, 0.05, 0.05],
-                    color: [0.05, 0.05, 0.05, 0.0],
+                    position: [0.3, 0.3, 0.3],
+                    color: [0.3, 0.3, 0.3, 0.3],
                 },
                 3,
                 Vertex {
@@ -607,12 +651,12 @@ fn main() {
                     color: [1.0, 1.0, 1.0, 1.0],
                 },
             ))
-            .with_reinsertion(ElitistReinserter::new(FitnessCalc{}, false, 0.7))
+            .with_reinsertion(ElitistReinserter::new(FitnessCalc{goal_image: goal_image.clone()}, false, 0.7))
             .with_initial_population(initial_population)
             .build(),
     )
     .until(or(
-        FitnessLimit::new(FitnessCalc{}.highest_possible_fitness()),
+        FitnessLimit::new(FitnessCalc{goal_image: goal_image.clone()}.highest_possible_fitness()),
         GenerationLimit::new(GENERATION_LIMIT),
     ))
     .build();
@@ -663,7 +707,7 @@ fn main() {
     //         _ => {}
     //     }
         let amount_of_polygons = 100;
-        state.vertices = Vec::with_capacity(0);
+        // state.vertices = Vec::with_capacity(0);
 
         while is_sim_running {
             let result = picture_sim.step();
