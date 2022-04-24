@@ -114,6 +114,16 @@ fn substract_rgba(first: &image::Rgba<u8>, second: &image::Rgba<u8>) -> usize {
     diff
 }
 
+fn generate_sign() -> i8 {
+    let mut rng = thread_rng();
+    let sign: f32 = rng.gen();
+    if sign >= 0.5 {
+        1
+    } else {
+        -1
+    }
+}
+
 impl FitnessFunction<Vertices, usize> for FitnessCalc {
     fn fitness_of(&self, vertices: &Vertices) -> usize {
         use std::time::Instant;
@@ -294,7 +304,7 @@ impl FitnessFunction<Vertices, usize> for FitnessCalc {
                 fitness_result += substract_rgba(self.goal_image.goal_image.get_pixel(i.0, i.1), i.2);
             }
             // println!("fitness: {}, calc: {}", fitness_result, (10000.0 - (fitness_result as f32 / 267386880.0) * 10000.0));
-            fitness_result = (10000.0 - (fitness_result as f32 / 267386880.0) * 10000.0) as usize;
+            fitness_result = (100000.0 - (fitness_result as f32 / 267386880.0) * 100000.0) as usize;
 
             // let elapsed = now.elapsed();
             // println!("Elapsed 1: {:.2?}", elapsed);
@@ -336,7 +346,7 @@ impl FitnessFunction<Vertices, usize> for FitnessCalc {
     }
 
     fn highest_possible_fitness(&self) -> usize {
-        10000
+        100000
     }
 
     fn lowest_possible_fitness(&self) -> usize {
@@ -351,16 +361,16 @@ impl BreederValueMutation for Vertex {
         Vertex {
             position: [
                 value.position[0]
-                    + (range.position[0] as f32 * rng.gen_range(0.0..adjustment) as f32 * sign as f32) as f32,
+                    + (range.position[0] as f32 * rng.gen_range(0.0..adjustment) as f32 * generate_sign() as f32) as f32,
                 value.position[1]
-                    + (range.position[1] as f32 * rng.gen_range(0.0..adjustment) as f32 * sign as f32) as f32,
+                    + (range.position[1] as f32 * rng.gen_range(0.0..adjustment) as f32 * generate_sign() as f32) as f32,
                 0.0,
             ],
             color: [
-                value.color[0] + (range.color[0] * rng.gen_range(0.0..adjustment) as f32 * sign as f32),
-                value.color[1] + (range.color[1] * rng.gen_range(0.0..adjustment) as f32 * sign as f32),
-                value.color[2] + (range.color[2] * rng.gen_range(0.0..adjustment) as f32 * sign as f32),
-                value.color[3] + (range.color[3] * rng.gen_range(0.0..adjustment) as f32 * sign as f32),
+                value.color[0] + (range.color[0] * rng.gen_range(0.0..adjustment) as f32 * generate_sign() as f32),
+                value.color[1] + (range.color[1] * rng.gen_range(0.0..adjustment) as f32 * generate_sign() as f32),
+                value.color[2] + (range.color[2] * rng.gen_range(0.0..adjustment) as f32 * generate_sign() as f32),
+                value.color[3] + (range.color[3] * rng.gen_range(0.0..adjustment) as f32 * generate_sign() as f32),
             ],
         }
     }
@@ -663,8 +673,8 @@ fn main() {
             .with_mutation(BreederValueMutator::new(
                 0.5,
                 Vertex {
-                    position: [0.1, 0.1, 0.1],
-                    color: [0.1, 0.1, 0.1, 0.1],
+                    position: [0.3, 0.3, 0.3],
+                    color: [0.3, 0.3, 0.3, 0.3],
                 },
                 3,
                 Vertex {
