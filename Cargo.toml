@@ -20,7 +20,7 @@ bytemuck = { version = "1.4", features = [ "derive" ] }
 rand = "0.8.5"
 smaa = "0.6.0"
 genevo = "0.7"
-dssim = "3.2.0"
+# dssim = "3.2.0"
 rgb = "0.8"
 
 [build-dependencies]
