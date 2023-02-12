@@ -18,7 +18,7 @@ use winit::{
 
 use wgpu::util::DeviceExt;
 
-const NUM_VERTICES: i16 = 450;
+const NUM_VERTICES: i16 = 90;
 const POPULATION_SIZE: usize = 200;
 const GENERATION_LIMIT: u64 = 10000;
 
@@ -53,13 +53,19 @@ impl GenomeBuilder<Vertices> for Pictures {
     where
         R: Rng + Sized,
     {
+        let mut v_index = 0;
+        let mut color_value: [f32; 3] = [rng.gen(), rng.gen(), rng.gen()];
         (0..NUM_VERTICES)
             .map(|_| {
-                Vertex {
-                position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0],
-                color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
-            }
-        })
+                if v_index % 3 == 0 {
+                    color_value = [rng.gen(), rng.gen(), rng.gen()];
+                }
+                v_index += 1;
+                return Vertex {
+                    position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0],
+                    color: [color_value[0], color_value[1], color_value[2], 1.0],
+                };
+            })
             .collect()
     }
 }
@@ -115,7 +121,7 @@ fn substract_rgba(first: &image::Rgba<u8>, second: &image::Rgba<u8>) -> usize {
     diff += (first[0] as i32 - second[0] as i32).abs() as usize;
     diff += (first[1] as i32 - second[1] as i32).abs() as usize;
     diff += (first[2] as i32 - second[2] as i32).abs() as usize;
-    diff += (first[3] as i32 - second[3] as i32).abs() as usize;
+    //    diff += (first[3] as i32 - second[3] as i32).abs() as usize;
     diff
 }
 
@@ -305,8 +311,9 @@ impl FitnessFunction<Vertices, usize> for FitnessCalc<'_> {
                     substract_rgba(self.goal_image.goal_image.get_pixel(i.0, i.1), i.2);
             }
             fitness_result =
-                (10000000.0 - (fitness_result as f32 / 267386880.0) * 10000000.0) as usize;
+                (10000000.0 - (fitness_result as f32 / 200540160.0) * 10000000.0) as usize;
 
+            // println!("{:?}", &fitness_result);
             // let mut rng = thread_rng();
             // let id: u32 = rng.gen_range(0..100);
             // buffer.save(String::from("triangles/image") + &id.to_string() + ".png").unwrap();
@@ -349,6 +356,7 @@ impl BreederValueMutation for Vertex {
     fn breeder_mutated(value: Self, range: &Vertex, adjustment: f64, sign: i8) -> Self {
         // println!("{}", adjustment);
         let mut rng = thread_rng();
+        let color_adjustment = rng.gen_range(0.0..adjustment) as f32 * generate_sign() as f32;
         Vertex {
             position: [
                 value.position[0]
@@ -362,22 +370,10 @@ impl BreederValueMutation for Vertex {
                 0.0,
             ],
             color: [
-                value.color[0]
-                    + (range.color[0]
-                        * rng.gen_range(0.0..adjustment) as f32
-                        * generate_sign() as f32),
-                value.color[1]
-                    + (range.color[1]
-                        * rng.gen_range(0.0..adjustment) as f32
-                        * generate_sign() as f32),
-                value.color[2]
-                    + (range.color[2]
-                        * rng.gen_range(0.0..adjustment) as f32
-                        * generate_sign() as f32),
-                value.color[3]
-                    + (range.color[3]
-                        * rng.gen_range(0.0..adjustment) as f32
-                        * generate_sign() as f32),
+                value.color[0] + (range.color[0] * color_adjustment),
+                value.color[1] + (range.color[0] * color_adjustment),
+                value.color[2] + (range.color[0] * color_adjustment),
+                value.color[3],
             ],
         }
     }
@@ -452,7 +448,7 @@ fn main() {
     // for i in img_asrgb.enumerate_pixels() {
     //     println!("Pixel: {:?}", i.0);
     // }
-    let adjustment_size = 0.2;
+    let adjustment_size = 0.1;
     let mut picture_sim = simulate(
         genetic_algorithm()
             .with_evaluation(FitnessCalc {
@@ -460,7 +456,7 @@ fn main() {
                 device: &device,
                 queue: &queue,
             })
-            .with_selection(MaximizeSelector::new(0.8, 1))
+            .with_selection(MaximizeSelector::new(0.8, 4))
             .with_crossover(UniformCrossBreeder::new())
             .with_mutation(BreederValueMutator::new(
                 0.1,
@@ -490,7 +486,7 @@ fn main() {
                     queue: &queue,
                 },
                 false,
-                0.7,
+                0.9,
             ))
             .with_initial_population(initial_population)
             .build(),
