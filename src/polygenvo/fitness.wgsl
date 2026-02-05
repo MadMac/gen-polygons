@@ -22,6 +22,62 @@ fn rgb_to_grayscale(color: vec3<f32>) -> f32 {
     return color.r * 0.299 + color.g * 0.587 + color.b * 0.114;
 }
 
+// Sobel edge detection functions
+fn sobel_edge_magnitude(texture: texture_2d<f32>, x: u32, y: u32) -> f32 {
+    // Sobel kernels
+    let sobel_x = array<f32, 9>(
+        -1.0, 0.0, 1.0,
+        -2.0, 0.0, 2.0,
+        -1.0, 0.0, 1.0
+    );
+    
+    let sobel_y = array<f32, 9>(
+        -1.0, -2.0, -1.0,
+        0.0, 0.0, 0.0,
+        1.0, 2.0, 1.0
+    );
+    
+    // Sample 3x3 neighborhood
+    let center = textureLoad(texture, vec2<i32>(i32(x), i32(y)), 0).rgb;
+    
+    // Convert neighborhood to grayscale and apply Sobel kernels
+    let gx = 
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) - 1, i32(y) - 1), 0).rgb) * sobel_x[0] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x), i32(y) - 1), 0).rgb) * sobel_x[1] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) + 1, i32(y) - 1), 0).rgb) * sobel_x[2] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) - 1, i32(y)), 0).rgb) * sobel_x[3] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x), i32(y)), 0).rgb) * sobel_x[4] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) + 1, i32(y)), 0).rgb) * sobel_x[5] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) - 1, i32(y) + 1), 0).rgb) * sobel_x[6] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x), i32(y) + 1), 0).rgb) * sobel_x[7] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) + 1, i32(y) + 1), 0).rgb) * sobel_x[8];
+    
+    let gy = 
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) - 1, i32(y) - 1), 0).rgb) * sobel_y[0] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x), i32(y) - 1), 0).rgb) * sobel_y[1] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) + 1, i32(y) - 1), 0).rgb) * sobel_y[2] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) - 1, i32(y)), 0).rgb) * sobel_y[3] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x), i32(y)), 0).rgb) * sobel_y[4] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) + 1, i32(y)), 0).rgb) * sobel_y[5] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) - 1, i32(y) + 1), 0).rgb) * sobel_y[6] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x), i32(y) + 1), 0).rgb) * sobel_y[7] +
+        rgb_to_grayscale(textureLoad(texture, vec2<i32>(i32(x) + 1, i32(y) + 1), 0).rgb) * sobel_y[8];
+    
+    // Return edge magnitude
+    return sqrt(gx * gx + gy * gy);
+}
+
+fn calculate_edge_difference(goal_texture: texture_2d<f32>, rendered_texture: texture_2d<f32>, x: u32, y: u32) -> f32 {
+    let goal_edge = sobel_edge_magnitude(goal_texture, x, y);
+    let rendered_edge = sobel_edge_magnitude(rendered_texture, x, y);
+    
+    // Normalize edge magnitudes and calculate difference
+    let edge_diff = abs(goal_edge - rendered_edge);
+    
+    // Normalize to 0-1 range (approximate)
+    return edge_diff / 2.0; // Sobel typically produces values in 0-2 range
+}
+
 // Helper function for RGB to CIELAB conversion
 fn rgb_to_cielab(rgb: vec3<f32>) -> vec3<f32> {
     // Convert RGB to XYZ first
@@ -126,8 +182,8 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     // Calculate perceptual color difference
     let color_diff = perceptual_color_diff(goal_pixel.rgb, rendered_pixel.rgb);
     
-    // Simplified edge difference (temporarily disabled for compatibility)
-    let edge_diff = 0.0;
+    // Calculate edge difference using Sobel operator
+    let edge_diff = calculate_edge_difference(goal_texture, rendered_texture, x, y);
     
     // Combined fitness metric with adaptive weights from params
     let color_weight = f32(params.color_weight) / 1000.0;
