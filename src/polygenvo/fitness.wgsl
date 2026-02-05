@@ -51,9 +51,9 @@ fn rgb_to_cielab(rgb: vec3<f32>) -> vec3<f32> {
     let b = rgb.b;
     
     // Apply gamma correction
-    let r_linear = if r <= 0.04045 { r / 12.92 } else { pow((r + 0.055) / 1.055, 2.4) };
-    let g_linear = if g <= 0.04045 { g / 12.92 } else { pow((g + 0.055) / 1.055, 2.4) };
-    let b_linear = if b <= 0.04045 { b / 12.92 } else { pow((b + 0.055) / 1.055, 2.4) };
+    let r_linear = if (r <= 0.04045) { r / 12.92 } else { pow((r + 0.055) / 1.055, 2.4) };
+    let g_linear = if (g <= 0.04045) { g / 12.92 } else { pow((g + 0.055) / 1.055, 2.4) };
+    let b_linear = if (b <= 0.04045) { b / 12.92 } else { pow((b + 0.055) / 1.055, 2.4) };
     
     // Convert to XYZ
     let x = r_linear * 0.4124564 + g_linear * 0.3575761 + b_linear * 0.1804375;
@@ -66,9 +66,9 @@ fn rgb_to_cielab(rgb: vec3<f32>) -> vec3<f32> {
     let zn = z / 1.08883;
     
     // Convert to CIELAB
-    let fx = if xn > 0.008856 { pow(xn, 1.0/3.0) } else { (7.787 * xn) + (16.0 / 116.0) };
-    let fy = if yn > 0.008856 { pow(yn, 1.0/3.0) } else { (7.787 * yn) + (16.0 / 116.0) };
-    let fz = if zn > 0.008856 { pow(zn, 1.0/3.0) } else { (7.787 * zn) + (16.0 / 116.0) };
+    let fx = if (xn > 0.008856) { pow(xn, 1.0/3.0) } else { (7.787 * xn) + (16.0 / 116.0) };
+    let fy = if (yn > 0.008856) { pow(yn, 1.0/3.0) } else { (7.787 * yn) + (16.0 / 116.0) };
+    let fz = if (zn > 0.008856) { pow(zn, 1.0/3.0) } else { (7.787 * zn) + (16.0 / 116.0) };
     
     let l = 116.0 * fy - 16.0;
     let a = 500.0 * (fx - fy);
