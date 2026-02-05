@@ -70,7 +70,7 @@ impl GenomeBuilder<Vertices> for Pictures {
         (0..self.current_vertices)
             .map(|_| {
                 Vertex {
-                position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0],
+                position: [rng.gen_range(-0.9..0.9), rng.gen_range(-0.9..0.9), 0.0],  // Limit max size
                 color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
             }
         })
@@ -867,7 +867,7 @@ impl RandomValueMutation for Vertex {
         R: Rng + Sized,
     {
         Vertex {
-            position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0],
+            position: [rng.gen_range(-0.9..0.9), rng.gen_range(-0.9..0.9), 0.0],  // Limit max size
             color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
         }
     }
@@ -946,21 +946,21 @@ fn main() {
             .with_mutation(BreederValueMutator::new(
                 current_mutation_rate,  // Dynamic mutation rate
                 Vertex {
-                    position: [adjustment_size, adjustment_size, adjustment_size],
+                    position: [adjustment_size * 2.0, adjustment_size * 2.0, adjustment_size * 2.0], // Larger adjustment range
                     color: [
-                        adjustment_size,
-                        adjustment_size,
-                        adjustment_size,
-                        adjustment_size,
+                        adjustment_size * 1.5,
+                        adjustment_size * 1.5,
+                        adjustment_size * 1.5,
+                        adjustment_size * 1.5,
                     ],
                 },
-                3,  // More adjustment steps for finer mutations
+                5,  // More adjustment steps for finer mutations
                 Vertex {
-                    position: [-1.0, -1.0, -1.0],
+                    position: [-0.9, -0.9, -1.0],  // Limit max size to prevent single triangle dominance
                     color: [0.0, 0.0, 0.0, 0.0],
                 },
                 Vertex {
-                    position: [1.0, 1.0, 1.0],
+                    position: [0.9, 0.9, 1.0],    // Limit max size to prevent single triangle dominance
                     color: [1.0, 1.0, 1.0, 1.0],
                 },
             ))
