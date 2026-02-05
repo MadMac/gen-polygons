@@ -70,7 +70,7 @@ impl GenomeBuilder<Vertices> for Pictures {
         (0..self.current_vertices)
             .map(|_| {
                 Vertex {
-                position: [rng.gen_range(-0.9..0.9), rng.gen_range(-0.9..0.9), 0.0],  // Limit max size
+                position: [rng.gen_range(-0.4..0.4), rng.gen_range(-0.4..0.4), 0.0],  // Much smaller triangles
                 color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
             }
         })
@@ -867,7 +867,7 @@ impl RandomValueMutation for Vertex {
         R: Rng + Sized,
     {
         Vertex {
-            position: [rng.gen_range(-0.9..0.9), rng.gen_range(-0.9..0.9), 0.0],  // Limit max size
+            position: [rng.gen_range(-0.4..0.4), rng.gen_range(-0.4..0.4), 0.0],  // Much smaller triangles
             color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
         }
     }
@@ -956,11 +956,11 @@ fn main() {
                 },
                 5,  // More adjustment steps for finer mutations
                 Vertex {
-                    position: [-0.9, -0.9, -1.0],  // Limit max size to prevent single triangle dominance
+                    position: [-0.4, -0.4, -1.0],  // Much stricter limit for smaller triangles
                     color: [0.0, 0.0, 0.0, 0.0],
                 },
                 Vertex {
-                    position: [0.9, 0.9, 1.0],    // Limit max size to prevent single triangle dominance
+                    position: [0.4, 0.4, 1.0],    // Much stricter limit for smaller triangles
                     color: [1.0, 1.0, 1.0, 1.0],
                 },
             ))
