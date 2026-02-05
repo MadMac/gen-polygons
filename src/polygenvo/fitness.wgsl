@@ -20,6 +20,18 @@ fn rgb_to_grayscale(color: vec3<f32>) -> f32 {
     return color.r * 0.299 + color.g * 0.587 + color.b * 0.114;
 }
 
+// Multi-scale fitness evaluation
+// Returns fitness value for a given scale (0.0-1.0)
+fn evaluate_at_scale(texture: texture_2d<f32>, goal_texture: texture_2d<f32>, 
+                    x: u32, y: u32, scale: f32) -> f32 {
+    // For now, simple implementation
+    // In future: actual multi-scale rendering and comparison
+    return 1.0 - perceptual_color_diff(
+        textureLoad(texture, vec2<i32>(i32(x), i32(y)), 0).rgb,
+        textureLoad(goal_texture, vec2<i32>(i32(x), i32(y)), 0).rgb
+    );
+}
+
 // Helper function for perceptual color difference
 fn perceptual_color_diff(a: vec3<f32>, b: vec3<f32>) -> f32 {
     // Use weighted RGB difference based on human vision sensitivity
@@ -75,6 +87,21 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let color_weight = f32(params.color_weight) / 1000.0;
     let structure_weight = f32(params.structure_weight) / 1000.0;
     let combined_diff = color_diff * color_weight + edge_diff * structure_weight;
+    
+    // Multi-scale fitness evaluation
+    let scales = array<f32, 3>(0.5, 0.75, 1.0);
+    let scale_weights = array<f32, 3>(0.3, 0.3, 0.4);
+    
+    var multi_scale_fitness: f32 = 0.0;
+    for (var i: u32 = 0; i < 3; i++) {
+        let scale_fitness = evaluate_at_scale(
+            rendered_texture, goal_texture, x, y, scales[i]
+        );
+        multi_scale_fitness += scale_fitness * scale_weights[i];
+    }
+    
+    // Combine single-scale and multi-scale fitness
+    let combined_diff = combined_diff * 0.7 + (1.0 - multi_scale_fitness) * 0.3;
     
     // Convert to fitness value (lower difference = higher fitness)
     // Use sigmoid-like curve for better fitness distribution
