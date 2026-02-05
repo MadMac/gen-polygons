@@ -9,6 +9,9 @@ struct FitnessParams {
     padding: u32;
     color_weight: u32;
     structure_weight: u32;
+    scale_weight_0: u32;  // Weight for scale 0.5
+    scale_weight_1: u32;  // Weight for scale 0.75
+    scale_weight_2: u32;  // Weight for scale 1.0
 };
 
 struct FitnessResult {
@@ -302,7 +305,18 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let scale_fitness_1 = evaluate_at_scale(rendered_texture, goal_texture, x, y, 0.75);
     let scale_fitness_2 = evaluate_at_scale(rendered_texture, goal_texture, x, y, 1.0);
     
-    let multi_scale_fitness = scale_fitness_0 * 0.3 + scale_fitness_1 * 0.3 + scale_fitness_2 * 0.4;
+    // Use adaptive weights from params
+    let weight_0 = f32(params.scale_weight_0) / 1000.0;
+    let weight_1 = f32(params.scale_weight_1) / 1000.0;
+    let weight_2 = f32(params.scale_weight_2) / 1000.0;
+    
+    // Normalize weights
+    let total_weight = weight_0 + weight_1 + weight_2;
+    let norm_weight_0 = weight_0 / total_weight;
+    let norm_weight_1 = weight_1 / total_weight;
+    let norm_weight_2 = weight_2 / total_weight;
+    
+    let multi_scale_fitness = scale_fitness_0 * norm_weight_0 + scale_fitness_1 * norm_weight_1 + scale_fitness_2 * norm_weight_2;
     
     // Combine single-scale and multi-scale fitness
     let combined_diff = combined_diff * 0.7 + (1.0 - multi_scale_fitness) * 0.3;

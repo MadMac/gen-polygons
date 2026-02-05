@@ -343,8 +343,9 @@ impl<'a> FitnessCalc<'a> {
 
         // Initialize GPU compute resources with default weights
         // Weights will be updated during fitness calculation
+        // Use balanced scale weights as default (will be adaptive in future)
         let (compute_pipeline_opt, compute_bind_group_opt, fitness_buffer_opt, goal_texture_opt, goal_texture_view_opt) = 
-            Self::init_gpu_compute(&device, &queue, &goal_image, texture_size, 0.7, 0.3);
+            Self::init_gpu_compute(&device, &queue, &goal_image, texture_size, 0.7, 0.3, 0.3, 0.4, 0.3);
         
         let use_gpu_fitness = compute_pipeline_opt.is_some();
         
@@ -385,6 +386,9 @@ impl<'a> FitnessCalc<'a> {
         texture_size: u32,
         color_weight: f32,
         structure_weight: f32,
+        scale_weight_0: f32,
+        scale_weight_1: f32,
+        scale_weight_2: f32,
     ) -> (
         Option<wgpu::ComputePipeline>,
         Option<wgpu::BindGroup>,
@@ -460,7 +464,8 @@ impl<'a> FitnessCalc<'a> {
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Fitness Params"),
             contents: bytemuck::cast_slice(&[texture_size, texture_size, 2u32, 0u32, 
-                (color_weight * 1000.0) as u32, (structure_weight * 1000.0) as u32]),
+                (color_weight * 1000.0) as u32, (structure_weight * 1000.0) as u32,
+                (scale_weight_0 * 1000.0) as u32, (scale_weight_1 * 1000.0) as u32, (scale_weight_2 * 1000.0) as u32]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -519,6 +524,23 @@ impl<'a> FitnessCalc<'a> {
         } else {
             // Late generations: refine details
             (0.4, 0.6)
+        }
+    }
+    
+    /// Get adaptive scale weights based on current generation
+    fn get_adaptive_scale_weights(&self) -> (f32, f32, f32) {
+        if self.current_generation < 50 {
+            // Very early: focus on coarse scale (0.5)
+            (0.5, 0.3, 0.2) // scale 0.5, 0.75, 1.0
+        } else if self.current_generation < 150 {
+            // Early: balance coarse and medium scales
+            (0.4, 0.4, 0.2)
+        } else if self.current_generation < 300 {
+            // Middle: balance all scales
+            (0.3, 0.4, 0.3)
+        } else {
+            // Late: focus on fine details (1.0 scale)
+            (0.2, 0.3, 0.5)
         }
     }
     
