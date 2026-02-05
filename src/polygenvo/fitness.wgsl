@@ -120,6 +120,102 @@ fn cielab_color_diff(a: vec3<f32>, b: vec3<f32>) -> f32 {
     return sqrt(delta_l * delta_l + delta_a * delta_a + delta_b * delta_b);
 }
 
+// SSIM (Structural Similarity Index) approximation functions
+// Simplified version suitable for WGSL compute shaders
+
+fn calculate_ssim(goal_texture: texture_2d<f32>, rendered_texture: texture_2d<f32>, x: u32, y: u32) -> f32 {
+    // SSIM parameters (simplified)
+    let c1 = 0.01 * 0.01; // (k1*L)^2 where L=1, k1=0.01
+    let c2 = 0.03 * 0.03; // (k2*L)^2 where L=1, k2=0.03
+    
+    // Get current pixel values
+    let goal_center = textureLoad(goal_texture, vec2<i32>(i32(x), i32(y)), 0).rgb;
+    let rendered_center = textureLoad(rendered_texture, vec2<i32>(i32(x), i32(y)), 0).rgb;
+    
+    // Calculate means using 3x3 window (simplified)
+    let goal_mean = (
+        rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) - 1, i32(y) - 1), 0).rgb) +
+        rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x), i32(y) - 1), 0).rgb) +
+        rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) + 1, i32(y) - 1), 0).rgb) +
+        rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) - 1, i32(y)), 0).rgb) +
+        rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x), i32(y)), 0).rgb) +
+        rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) + 1, i32(y)), 0).rgb) +
+        rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) - 1, i32(y) + 1), 0).rgb) +
+        rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x), i32(y) + 1), 0).rgb) +
+        rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) + 1, i32(y) + 1), 0).rgb)
+    ) / 9.0;
+    
+    let rendered_mean = (
+        rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) - 1, i32(y) - 1), 0).rgb) +
+        rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x), i32(y) - 1), 0).rgb) +
+        rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) + 1, i32(y) - 1), 0).rgb) +
+        rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) - 1, i32(y)), 0).rgb) +
+        rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x), i32(y)), 0).rgb) +
+        rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) + 1, i32(y)), 0).rgb) +
+        rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) - 1, i32(y) + 1), 0).rgb) +
+        rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x), i32(y) + 1), 0).rgb) +
+        rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) + 1, i32(y) + 1), 0).rgb)
+    ) / 9.0;
+    
+    // Calculate variances (simplified - using squared differences)
+    let goal_var = (
+        pow(rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) - 1, i32(y) - 1), 0).rgb) - goal_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x), i32(y) - 1), 0).rgb) - goal_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) + 1, i32(y) - 1), 0).rgb) - goal_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) - 1, i32(y)), 0).rgb) - goal_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x), i32(y)), 0).rgb) - goal_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) + 1, i32(y)), 0).rgb) - goal_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) - 1, i32(y) + 1), 0).rgb) - goal_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x), i32(y) + 1), 0).rgb) - goal_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) + 1, i32(y) + 1), 0).rgb) - goal_mean, 2.0)
+    ) / 8.0;
+    
+    let rendered_var = (
+        pow(rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) - 1, i32(y) - 1), 0).rgb) - rendered_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x), i32(y) - 1), 0).rgb) - rendered_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) + 1, i32(y) - 1), 0).rgb) - rendered_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) - 1, i32(y)), 0).rgb) - rendered_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x), i32(y)), 0).rgb) - rendered_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) + 1, i32(y)), 0).rgb) - rendered_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) - 1, i32(y) + 1), 0).rgb) - rendered_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x), i32(y) + 1), 0).rgb) - rendered_mean, 2.0) +
+        pow(rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) + 1, i32(y) + 1), 0).rgb) - rendered_mean, 2.0)
+    ) / 8.0;
+    
+    // Calculate covariance
+    let covariance = (
+        (rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) - 1, i32(y) - 1), 0).rgb) - goal_mean) *
+        (rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) - 1, i32(y) - 1), 0).rgb) - rendered_mean) +
+        (rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x), i32(y) - 1), 0).rgb) - goal_mean) *
+        (rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x), i32(y) - 1), 0).rgb) - rendered_mean) +
+        (rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) + 1, i32(y) - 1), 0).rgb) - goal_mean) *
+        (rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) + 1, i32(y) - 1), 0).rgb) - rendered_mean) +
+        (rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) - 1, i32(y)), 0).rgb) - goal_mean) *
+        (rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) - 1, i32(y)), 0).rgb) - rendered_mean) +
+        (rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x), i32(y)), 0).rgb) - goal_mean) *
+        (rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x), i32(y)), 0).rgb) - rendered_mean) +
+        (rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) + 1, i32(y)), 0).rgb) - goal_mean) *
+        (rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) + 1, i32(y)), 0).rgb) - rendered_mean) +
+        (rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) - 1, i32(y) + 1), 0).rgb) - goal_mean) *
+        (rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) - 1, i32(y) + 1), 0).rgb) - rendered_mean) +
+        (rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x), i32(y) + 1), 0).rgb) - goal_mean) *
+        (rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x), i32(y) + 1), 0).rgb) - rendered_mean) +
+        (rgb_to_grayscale(textureLoad(goal_texture, vec2<i32>(i32(x) + 1, i32(y) + 1), 0).rgb) - goal_mean) *
+        (rgb_to_grayscale(textureLoad(rendered_texture, vec2<i32>(i32(x) + 1, i32(y) + 1), 0).rgb) - rendered_mean)
+    ) / 8.0;
+    
+    // Calculate SSIM components
+    let luminance = (2.0 * goal_mean * rendered_mean + c1) / (goal_mean * goal_mean + rendered_mean * rendered_mean + c1);
+    let contrast = (2.0 * sqrt(goal_var) * sqrt(rendered_var) + c2) / (goal_var + rendered_var + c2);
+    let structure = (covariance + c2 / 2.0) / (sqrt(goal_var) * sqrt(rendered_var) + c2 / 2.0);
+    
+    // Combine components
+    let ssim = luminance * contrast * structure;
+    
+    // Convert SSIM (0-1) to difference (0-1) where 0 = perfect match
+    return (1.0 - ssim) / 2.0;
+}
+
 // Helper function for perceptual color difference
 fn perceptual_color_diff(a: vec3<f32>, b: vec3<f32>) -> f32 {
     // Convert to CIELAB for better perceptual matching
@@ -185,10 +281,21 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     // Calculate edge difference using Sobel operator
     let edge_diff = calculate_edge_difference(goal_texture, rendered_texture, x, y);
     
+    // Calculate SSIM difference
+    let ssim_diff = calculate_ssim(goal_texture, rendered_texture, x, y);
+    
     // Combined fitness metric with adaptive weights from params
     let color_weight = f32(params.color_weight) / 1000.0;
     let structure_weight = f32(params.structure_weight) / 1000.0;
-    let combined_diff = color_diff * color_weight + edge_diff * structure_weight;
+    let ssim_weight = 0.3; // Fixed weight for SSIM component
+    
+    // Normalize weights
+    let total_weight = color_weight + structure_weight + ssim_weight;
+    let color_weight_norm = color_weight / total_weight;
+    let structure_weight_norm = structure_weight / total_weight;
+    let ssim_weight_norm = ssim_weight / total_weight;
+    
+    let combined_diff = color_diff * color_weight_norm + edge_diff * structure_weight_norm + ssim_diff * ssim_weight_norm;
     
     // Multi-scale fitness evaluation
     let scale_fitness_0 = evaluate_at_scale(rendered_texture, goal_texture, x, y, 0.5);
