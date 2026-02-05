@@ -15,6 +15,17 @@ struct FitnessResult {
     value: u32;
 };
 
+// Helper function for perceptual color difference
+fn perceptual_color_diff(a: vec3<f32>, b: vec3<f32>) -> f32 {
+    // Use weighted RGB difference based on human vision sensitivity
+    let r_diff = abs(a.r - b.r);
+    let g_diff = abs(a.g - b.g);
+    let b_diff = abs(a.b - b.b);
+    
+    // Human vision is most sensitive to green, then red, then blue
+    return r_diff * 0.3 + g_diff * 0.59 + b_diff * 0.11;
+}
+
 // Helper function for RGB to grayscale conversion
 fn rgb_to_grayscale(color: vec3<f32>) -> f32 {
     return color.r * 0.299 + color.g * 0.587 + color.b * 0.114;
