@@ -15,32 +15,11 @@ struct FitnessResult {
     value: u32;
 };
 
-// Helper function for perceptual color difference
-fn perceptual_color_diff(a: vec3<f32>, b: vec3<f32>) -> f32 {
-    // Use weighted RGB difference based on human vision sensitivity
-    let r_diff = abs(a.r - b.r);
-    let g_diff = abs(a.g - b.g);
-    let b_diff = abs(a.b - b.b);
-    
-    // Human vision is most sensitive to green, then red, then blue
-    return r_diff * 0.3 + g_diff * 0.59 + b_diff * 0.11;
-}
+
 
 // Helper function for RGB to grayscale conversion
 fn rgb_to_grayscale(color: vec3<f32>) -> f32 {
     return color.r * 0.299 + color.g * 0.587 + color.b * 0.114;
-}
-
-// Multi-scale fitness evaluation
-// Returns fitness value for a given scale (0.0-1.0)
-fn evaluate_at_scale(texture: texture_2d<f32>, goal_texture: texture_2d<f32>, 
-                    x: u32, y: u32, scale: f32) -> f32 {
-    // For now, simple implementation
-    // In future: actual multi-scale rendering and comparison
-    return 1.0 - perceptual_color_diff(
-        textureLoad(texture, vec2<i32>(i32(x), i32(y)), 0).rgb,
-        textureLoad(goal_texture, vec2<i32>(i32(x), i32(y)), 0).rgb
-    );
 }
 
 // Helper function for RGB to CIELAB conversion
@@ -50,10 +29,10 @@ fn rgb_to_cielab(rgb: vec3<f32>) -> vec3<f32> {
     let g = rgb.g;
     let b = rgb.b;
     
-    // Apply gamma correction
-    let r_linear = if (r <= 0.04045) { r / 12.92 } else { pow((r + 0.055) / 1.055, 2.4) };
-    let g_linear = if (g <= 0.04045) { g / 12.92 } else { pow((g + 0.055) / 1.055, 2.4) };
-    let b_linear = if (b <= 0.04045) { b / 12.92 } else { pow((b + 0.055) / 1.055, 2.4) };
+    // Apply gamma correction using select
+    let r_linear = select(r / 12.92, ((r + 0.055) / 1.055) * ((r + 0.055) / 1.055) * ((r + 0.055) / 1.055), r <= 0.04045);
+    let g_linear = select(g / 12.92, ((g + 0.055) / 1.055) * ((g + 0.055) / 1.055) * ((g + 0.055) / 1.055), g <= 0.04045);
+    let b_linear = select(b / 12.92, ((b + 0.055) / 1.055) * ((b + 0.055) / 1.055) * ((b + 0.055) / 1.055), b <= 0.04045);
     
     // Convert to XYZ
     let x = r_linear * 0.4124564 + g_linear * 0.3575761 + b_linear * 0.1804375;
@@ -66,9 +45,9 @@ fn rgb_to_cielab(rgb: vec3<f32>) -> vec3<f32> {
     let zn = z / 1.08883;
     
     // Convert to CIELAB
-    let fx = if (xn > 0.008856) { pow(xn, 1.0/3.0) } else { (7.787 * xn) + (16.0 / 116.0) };
-    let fy = if (yn > 0.008856) { pow(yn, 1.0/3.0) } else { (7.787 * yn) + (16.0 / 116.0) };
-    let fz = if (zn > 0.008856) { pow(zn, 1.0/3.0) } else { (7.787 * zn) + (16.0 / 116.0) };
+    let fx = select(pow(xn, 1.0/3.0), (7.787 * xn) + (16.0 / 116.0), xn <= 0.008856);
+    let fy = select(pow(yn, 1.0/3.0), (7.787 * yn) + (16.0 / 116.0), yn <= 0.008856);
+    let fz = select(pow(zn, 1.0/3.0), (7.787 * zn) + (16.0 / 116.0), zn <= 0.008856);
     
     let l = 116.0 * fy - 16.0;
     let a = 500.0 * (fx - fy);
@@ -96,6 +75,18 @@ fn perceptual_color_diff(a: vec3<f32>, b: vec3<f32>) -> f32 {
     
     // Normalize and scale
     return cielab_diff / 100.0; // CIELAB ΔE76 typically ranges 0-100
+}
+
+// Multi-scale fitness evaluation
+// Returns fitness value for a given scale (0.0-1.0)
+fn evaluate_at_scale(texture: texture_2d<f32>, goal_texture: texture_2d<f32>, 
+                    x: u32, y: u32, scale: f32) -> f32 {
+    // For now, simple implementation
+    // In future: actual multi-scale rendering and comparison
+    return 1.0 - perceptual_color_diff(
+        textureLoad(texture, vec2<i32>(i32(x), i32(y)), 0).rgb,
+        textureLoad(goal_texture, vec2<i32>(i32(x), i32(y)), 0).rgb
+    );
 }
 
 
@@ -144,16 +135,11 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let combined_diff = color_diff * color_weight + edge_diff * structure_weight;
     
     // Multi-scale fitness evaluation
-    let scales = array<f32, 3>(0.5, 0.75, 1.0);
-    let scale_weights = array<f32, 3>(0.3, 0.3, 0.4);
+    let scale_fitness_0 = evaluate_at_scale(rendered_texture, goal_texture, x, y, 0.5);
+    let scale_fitness_1 = evaluate_at_scale(rendered_texture, goal_texture, x, y, 0.75);
+    let scale_fitness_2 = evaluate_at_scale(rendered_texture, goal_texture, x, y, 1.0);
     
-    var multi_scale_fitness: f32 = 0.0;
-    for (var i: u32 = 0; i < 3; i++) {
-        let scale_fitness = evaluate_at_scale(
-            rendered_texture, goal_texture, x, y, scales[i]
-        );
-        multi_scale_fitness += scale_fitness * scale_weights[i];
-    }
+    let multi_scale_fitness = scale_fitness_0 * 0.3 + scale_fitness_1 * 0.3 + scale_fitness_2 * 0.4;
     
     // Combine single-scale and multi-scale fitness
     let combined_diff = combined_diff * 0.7 + (1.0 - multi_scale_fitness) * 0.3;
