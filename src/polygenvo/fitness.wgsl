@@ -32,15 +32,59 @@ fn evaluate_at_scale(texture: texture_2d<f32>, goal_texture: texture_2d<f32>,
     );
 }
 
+// Helper function for RGB to CIELAB conversion
+fn rgb_to_cielab(rgb: vec3<f32>) -> vec3<f32> {
+    // Convert RGB to XYZ first
+    let r = rgb.r;
+    let g = rgb.g;
+    let b = rgb.b;
+    
+    // Apply gamma correction
+    let r_linear = if r <= 0.04045 { r / 12.92 } else { pow((r + 0.055) / 1.055, 2.4) };
+    let g_linear = if g <= 0.04045 { g / 12.92 } else { pow((g + 0.055) / 1.055, 2.4) };
+    let b_linear = if b <= 0.04045 { b / 12.92 } else { pow((b + 0.055) / 1.055, 2.4) };
+    
+    // Convert to XYZ
+    let x = r_linear * 0.4124564 + g_linear * 0.3575761 + b_linear * 0.1804375;
+    let y = r_linear * 0.2126729 + g_linear * 0.7151522 + b_linear * 0.0721750;
+    let z = r_linear * 0.0193339 + g_linear * 0.1191920 + b_linear * 0.9503041;
+    
+    // Normalize for D65 illuminant
+    let xn = x / 0.95047;
+    let yn = y / 1.00000;
+    let zn = z / 1.08883;
+    
+    // Convert to CIELAB
+    let fx = if xn > 0.008856 { pow(xn, 1.0/3.0) } else { (7.787 * xn) + (16.0 / 116.0) };
+    let fy = if yn > 0.008856 { pow(yn, 1.0/3.0) } else { (7.787 * yn) + (16.0 / 116.0) };
+    let fz = if zn > 0.008856 { pow(zn, 1.0/3.0) } else { (7.787 * zn) + (16.0 / 116.0) };
+    
+    let l = 116.0 * fy - 16.0;
+    let a = 500.0 * (fx - fy);
+    let b = 200.0 * (fy - fz);
+    
+    return vec3<f32>(l, a, b);
+}
+
+// Helper function for CIELAB color difference (ΔE76)
+fn cielab_color_diff(a: vec3<f32>, b: vec3<f32>) -> f32 {
+    let delta_l = a.x - b.x;
+    let delta_a = a.y - b.y;
+    let delta_b = a.z - b.z;
+    return sqrt(delta_l * delta_l + delta_a * delta_a + delta_b * delta_b);
+}
+
 // Helper function for perceptual color difference
 fn perceptual_color_diff(a: vec3<f32>, b: vec3<f32>) -> f32 {
-    // Use weighted RGB difference based on human vision sensitivity
-    let r_diff = abs(a.r - b.r);
-    let g_diff = abs(a.g - b.g);
-    let b_diff = abs(a.b - b.b);
+    // Convert to CIELAB for better perceptual matching
+    let lab_a = rgb_to_cielab(a);
+    let lab_b = rgb_to_cielab(b);
     
-    // Human vision is most sensitive to green, then red, then blue
-    return r_diff * 0.3 + g_diff * 0.59 + b_diff * 0.11;
+    // Use CIELAB difference for better perceptual accuracy
+    let cielab_diff = cielab_color_diff(lab_a, lab_b);
+    
+    // Normalize and scale
+    return cielab_diff / 100.0; // CIELAB ΔE76 typically ranges 0-100
 }
 
 
