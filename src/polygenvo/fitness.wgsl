@@ -7,6 +7,8 @@ struct FitnessParams {
     image_height: u32;
     sample_step: u32;
     padding: u32;
+    color_weight: u32;
+    structure_weight: u32;
 };
 
 struct FitnessResult {
@@ -69,8 +71,10 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     // Simplified edge difference (temporarily disabled for compatibility)
     let edge_diff = 0.0;
     
-    // Combined fitness metric: 70% color accuracy, 30% edge preservation
-    let combined_diff = color_diff * 0.7 + edge_diff * 0.3;
+    // Combined fitness metric with adaptive weights from params
+    let color_weight = f32(params.color_weight) / 1000.0;
+    let structure_weight = f32(params.structure_weight) / 1000.0;
+    let combined_diff = color_diff * color_weight + edge_diff * structure_weight;
     
     // Convert to fitness value (lower difference = higher fitness)
     // Use sigmoid-like curve for better fitness distribution

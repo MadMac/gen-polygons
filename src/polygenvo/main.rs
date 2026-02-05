@@ -136,6 +136,8 @@ struct FitnessCalc<'a> {
     goal_texture: Option<wgpu::Texture>,
     goal_texture_view: Option<wgpu::TextureView>,
     use_gpu_fitness: bool,
+    // Generation tracking for adaptive fitness
+    current_generation: u64,
 }
 
 impl<'a> Clone for FitnessCalc<'a> {
@@ -223,6 +225,7 @@ impl<'a> Clone for FitnessCalc<'a> {
             goal_texture: None,
             goal_texture_view: None,
             use_gpu_fitness: false,
+            current_generation: 0,
         }
     }
 }
@@ -338,9 +341,10 @@ impl<'a> FitnessCalc<'a> {
         };
         let output_buffer = device.create_buffer(&output_buffer_desc);
 
-        // Initialize GPU compute resources
+        // Initialize GPU compute resources with default weights
+        // Weights will be updated during fitness calculation
         let (compute_pipeline_opt, compute_bind_group_opt, fitness_buffer_opt, goal_texture_opt, goal_texture_view_opt) = 
-            Self::init_gpu_compute(&device, &queue, &goal_image, texture_size);
+            Self::init_gpu_compute(&device, &queue, &goal_image, texture_size, 0.7, 0.3);
         
         let use_gpu_fitness = compute_pipeline_opt.is_some();
         
@@ -368,6 +372,7 @@ impl<'a> FitnessCalc<'a> {
             goal_texture,
             goal_texture_view,
             use_gpu_fitness,
+            current_generation: 0,
         }
     }
 }
@@ -378,6 +383,8 @@ impl<'a> FitnessCalc<'a> {
         queue: &'a wgpu::Queue,
         goal_image: &GoalImage,
         texture_size: u32,
+        color_weight: f32,
+        structure_weight: f32,
     ) -> (
         Option<wgpu::ComputePipeline>,
         Option<wgpu::BindGroup>,
@@ -452,7 +459,8 @@ impl<'a> FitnessCalc<'a> {
         let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Fitness Params"),
-            contents: bytemuck::cast_slice(&[texture_size, texture_size, 2u32, 0u32]),
+            contents: bytemuck::cast_slice(&[texture_size, texture_size, 2u32, 0u32, 
+                (color_weight * 1000.0) as u32, (structure_weight * 1000.0) as u32]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -493,6 +501,25 @@ impl<'a> FitnessCalc<'a> {
             Some(goal_texture),
             Some(goal_texture_view),
         )
+    }
+    
+    /// Update generation counter for adaptive fitness
+    fn update_generation(&mut self, generation: u64) {
+        self.current_generation = generation;
+    }
+    
+    /// Get adaptive fitness weights based on current generation
+    fn get_adaptive_weights(&self) -> (f32, f32) {
+        if self.current_generation < 100 {
+            // Early generations: focus on coarse structure
+            (0.6, 0.4) // color, structure
+        } else if self.current_generation < 300 {
+            // Middle generations: balance
+            (0.5, 0.5)
+        } else {
+            // Late generations: refine details
+            (0.4, 0.6)
+        }
     }
 }
 
@@ -558,6 +585,9 @@ impl FitnessFunction<Vertices, usize> for FitnessCalc<'_> {
         queue.submit(Some(encoder.finish()));
 
         let mut fitness_result: usize = 0;
+
+        // Get adaptive weights based on current generation
+        let (color_weight, structure_weight) = self.get_adaptive_weights();
 
         // Try to use GPU compute for fitness calculation if available
         if self.use_gpu_fitness {
