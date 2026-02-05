@@ -521,6 +521,71 @@ impl<'a> FitnessCalc<'a> {
             (0.4, 0.6)
         }
     }
+    
+    /// Calculate distance between two genomes for fitness sharing
+    fn genome_distance(a: &Vertices, b: &Vertices) -> f32 {
+        if a.len() != b.len() {
+            return 1.0; // Maximum distance if different lengths
+        }
+        
+        let mut total_distance = 0.0;
+        let vertex_count = a.len();
+        
+        for i in 0..vertex_count {
+            // Position distance (Euclidean)
+            let pos_diff_x = a[i].position[0] - b[i].position[0];
+            let pos_diff_y = a[i].position[1] - b[i].position[1];
+            let pos_diff_z = a[i].position[2] - b[i].position[2];
+            let pos_distance = (pos_diff_x * pos_diff_x + pos_diff_y * pos_diff_y + pos_diff_z * pos_diff_z).sqrt();
+            
+            // Color distance (Euclidean in RGBA space)
+            let color_diff_r = a[i].color[0] - b[i].color[0];
+            let color_diff_g = a[i].color[1] - b[i].color[1];
+            let color_diff_b = a[i].color[2] - b[i].color[2];
+            let color_diff_a = a[i].color[3] - b[i].color[3];
+            let color_distance = (color_diff_r * color_diff_r + color_diff_g * color_diff_g + 
+                                color_diff_b * color_diff_b + color_diff_a * color_diff_a).sqrt();
+            
+            // Combine position and color distances
+            total_distance += pos_distance * 0.6 + color_distance * 0.4;
+        }
+        
+        // Normalize by vertex count and number of components
+        total_distance / (vertex_count as f32 * 1.4) // 0.6 + 0.4 = 1.0, but normalized
+    }
+    
+    /// Apply diversity bonus to fitness values
+    fn apply_diversity_bonus(&self, population: &[Vertices], fitness_values: &mut [usize], rng: &mut impl Rng) {
+        let diversity_strength = 0.05; // 5% diversity bonus
+        
+        // Calculate average fitness
+        let avg_fitness: f32 = fitness_values.iter().map(|&f| f as f32).sum::<f32>() / fitness_values.len() as f32;
+        
+        for i in 0..population.len() {
+            // Calculate diversity score based on distance to other solutions
+            let mut diversity_score = 0.0;
+            let mut min_distance = f32::MAX;
+            
+            for j in 0..population.len() {
+                if i != j {
+                    let distance = Self::genome_distance(&population[i], &population[j]);
+                    if distance < min_distance {
+                        min_distance = distance;
+                    }
+                    diversity_score += distance;
+                }
+            }
+            
+            // Normalize diversity score
+            let normalized_diversity = min_distance / 0.5; // Target distance of 0.5
+            let diversity_bonus = (normalized_diversity * diversity_strength * avg_fitness).clamp(0.0, avg_fitness * 0.1);
+            
+            // Add small random component to break ties and maintain diversity
+            let random_component = rng.gen_range(0.0..avg_fitness * 0.01);
+            
+            fitness_values[i] = ((fitness_values[i] as f32) + diversity_bonus + random_component) as usize;
+        }
+    }
 }
 
 impl FitnessFunction<Vertices, usize> for FitnessCalc<'_> {
@@ -854,7 +919,7 @@ fn main() {
     let mut picture_sim = simulate(
         genetic_algorithm()
             .with_evaluation(fitness_calc.clone())
-            .with_selection(MaximizeSelector::new(0.6, 1))  // Less selective pressure to maintain diversity
+            .with_selection(MaximizeSelector::new(0.4, 1))  // Reduced selective pressure for better diversity
             .with_crossover(UniformCrossBreeder::new())
             .with_mutation(BreederValueMutator::new(
                 current_mutation_rate,  // Dynamic mutation rate
