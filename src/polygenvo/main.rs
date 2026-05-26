@@ -266,7 +266,9 @@ impl<'a> FitnessCalc<'a> {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             label: None,
         };
 
@@ -344,8 +346,8 @@ impl<'a> FitnessCalc<'a> {
         // Initialize GPU compute resources with default weights
         // Weights will be updated during fitness calculation
         // Use balanced scale weights as default (will be adaptive in future)
-        let (compute_pipeline_opt, compute_bind_group_opt, fitness_buffer_opt, goal_texture_opt, goal_texture_view_opt) = 
-            Self::init_gpu_compute(&device, &queue, &goal_image, texture_size, 0.7, 0.3, 0.3, 0.4, 0.3);
+        let (compute_pipeline_opt, compute_bind_group_opt, fitness_buffer_opt, goal_texture_opt, goal_texture_view_opt) =
+            Self::init_gpu_compute(&device, &queue, &goal_image, &texture_view, texture_size, 0.7, 0.3, 0.3, 0.4, 0.3);
         
         let use_gpu_fitness = compute_pipeline_opt.is_some();
         
@@ -383,6 +385,7 @@ impl<'a> FitnessCalc<'a> {
         device: &'a wgpu::Device,
         queue: &'a wgpu::Queue,
         goal_image: &GoalImage,
+        rendered_texture_view: &wgpu::TextureView,
         texture_size: u32,
         color_weight: f32,
         structure_weight: f32,
@@ -423,7 +426,9 @@ impl<'a> FitnessCalc<'a> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            // sRGB so sampling matches the rendered texture's color space (Rgba8UnormSrgb).
+            // Goal PNG bytes are sRGB-encoded; the format does the decode on read.
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         });
         
@@ -486,7 +491,7 @@ impl<'a> FitnessCalc<'a> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&goal_texture_view), // Use goal texture view as placeholder
+                    resource: wgpu::BindingResource::TextureView(rendered_texture_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -746,11 +751,12 @@ impl FitnessFunction<Vertices, usize> for FitnessCalc<'_> {
                 
                 // Aggressive sampling - larger steps for much faster evaluation
                 let sample_step = if vertices.len() < 100 { 4 } else { 3 };
-                
-                // Use a smaller, representative region for very fast evaluation
-                let sample_end_x = (self.texture_size * 3/4) as u32;
-                let sample_end_y = (self.texture_size * 3/4) as u32;
-                
+
+                // Sample the full image; previous 3/4 window let the bottom-right quadrant
+                // contribute nothing to fitness.
+                let sample_end_x = self.texture_size as u32;
+                let sample_end_y = self.texture_size as u32;
+
                 for y in (0..sample_end_y).step_by(sample_step) {
                     for x in (0..sample_end_x).step_by(sample_step) {
                         // Ensure we don't access out of bounds pixels
@@ -934,17 +940,17 @@ fn main() {
     let adjustment_size = 0.1;
     let fitness_calc = FitnessCalc::new(goal_image.clone(), &device, &queue);
     
-    // Adaptive mutation tracking
+    // Sliding window of recent best-fitness values, used for convergence detection.
     let mut fitness_history: VecDeque<usize> = VecDeque::with_capacity(10);
-    let mut current_mutation_rate = 0.2;
-    
+    let mutation_rate = 0.2;
+
     let mut picture_sim = simulate(
         genetic_algorithm()
             .with_evaluation(fitness_calc.clone())
             .with_selection(MaximizeSelector::new(0.4, 1))  // Reduced selective pressure for better diversity
             .with_crossover(UniformCrossBreeder::new())
             .with_mutation(BreederValueMutator::new(
-                current_mutation_rate,  // Dynamic mutation rate
+                mutation_rate,
                 Vertex {
                     position: [adjustment_size * 2.0, adjustment_size * 2.0, adjustment_size * 2.0], // Larger adjustment range
                     color: [
@@ -1051,39 +1057,13 @@ fn main() {
                 //     })).unwrap();
                 // let (device, queue) = block_on(adapter
                 //     .request_device(&Default::default(), None)).unwrap();
-                // Track fitness history for adaptive mutation
+                // Track fitness history for convergence detection
                 fitness_history.push_back(best_solution.solution.fitness);
-                
-                // Adaptive mutation strategy
-                if fitness_history.len() >= 2 {
-                    let recent_improvement = best_solution.solution.fitness as i32 - 
-                        fitness_history[fitness_history.len() - 2] as i32;
-                    let improvement_rate = recent_improvement as f32 / 
-                        fitness_history[fitness_history.len() - 2] as f32;
-                    
-                    // Adjust mutation rate based on improvement
-                    if improvement_rate < 0.005 {
-                        // Stagnating - increase mutation
-                        current_mutation_rate = (current_mutation_rate * 1.2).min(0.4);
-                    } else if improvement_rate > 0.02 {
-                        // Improving well - decrease mutation
-                        current_mutation_rate = (current_mutation_rate * 0.8).max(0.1);
-                    }
-                    // Else keep current rate
+                if fitness_history.len() > 10 {
+                    fitness_history.pop_front();
                 }
-                
-                // Log adaptive mutation rate changes
-                if fitness_history.len() >= 2 {
-                    let recent_improvement = best_solution.solution.fitness as i32 - 
-                        fitness_history[fitness_history.len() - 2] as i32;
-                    let improvement_rate = recent_improvement as f32 / 
-                        fitness_history[fitness_history.len() - 2] as f32;
-                    
-                    if improvement_rate < 0.005 || improvement_rate > 0.02 {
-                        println!("Adaptive mutation rate adjusted to: {:.3}", current_mutation_rate);
-                    }
-                }
-                
+
+
                 // Only save images occasionally to improve performance
                 if best_solution.solution.fitness > current_best_fitness && 
                    (step.iteration % 100 == 0 || step.iteration < 5) {
@@ -1266,9 +1246,9 @@ fn main() {
                     let min_fitness = *fitness_history.iter().min().unwrap_or(&0);
                     let fitness_range = max_fitness as f32 - min_fitness as f32;
                     
-                    // If fitness range is very small, we've converged
-                    if fitness_range < 5000.0 && current_mutation_rate > 0.3 {
-                        println!("Convergence detected at generation {}. Final fitness: {}", 
+                    // If best fitness has barely moved over the last 10 generations, we've converged.
+                    if fitness_range < 5000.0 {
+                        println!("Convergence detected at generation {}. Final fitness: {}",
                                 step.iteration, best_solution.solution.fitness);
                         break;
                     }
