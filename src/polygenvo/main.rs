@@ -4,6 +4,7 @@ use rand::prelude::*;
 use std::collections::VecDeque;
 use std::iter;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 // use dssim::*;
 use image::{ImageBuffer, Rgba};
 use rgb::*;
@@ -117,126 +118,29 @@ impl fmt::Debug for GoalImage {
     }
 }
 
-#[derive(Debug)]
-struct FitnessCalc<'a> {
-    goal_image: GoalImage,
-    device: &'a wgpu::Device,
-    queue: &'a wgpu::Queue,
+struct FitnessCalcInner {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     texture_size: u32,
-    texture_desc: wgpu::TextureDescriptor<'a>,
     render_pipeline: wgpu::RenderPipeline,
-    texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
-    output_buffer: wgpu::Buffer,
-    u32_size: u32,
-    // GPU compute resources for accelerated fitness
-    compute_pipeline: Option<wgpu::ComputePipeline>,
-    compute_bind_group: Option<wgpu::BindGroup>,
-    fitness_buffer: Option<wgpu::Buffer>,
-    goal_texture: Option<wgpu::Texture>,
-    goal_texture_view: Option<wgpu::TextureView>,
-    use_gpu_fitness: bool,
-    // Generation tracking for adaptive fitness
-    current_generation: u64,
+    vertex_buffer: wgpu::Buffer,
+    vertex_capacity: u64,
+    compute_pipeline: wgpu::ComputePipeline,
+    compute_bind_group: wgpu::BindGroup,
+    fitness_buffer: wgpu::Buffer,
+    fitness_readback: wgpu::Buffer,
 }
 
-impl<'a> Clone for FitnessCalc<'a> {
-    fn clone(&self) -> Self {
-        // Recreate the render pipeline since it doesn't implement Clone
-        let shader = self.device.create_shader_module(&wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
+#[derive(Clone)]
+struct FitnessCalc {
+    inner: Arc<FitnessCalcInner>,
+}
 
-        let render_pipeline_layout =
-            self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[],
-                push_constant_ranges: &[],
-            });
-
-        let render_pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[Vertex::desc()],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[wgpu::ColorTargetState {
-                    format: self.texture_desc.format,
-                    blend: Some(wgpu::BlendState {
-                        alpha: wgpu::BlendComponent::OVER,
-                        color: wgpu::BlendComponent::OVER,
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                }],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: true,
-            },
-            multiview: None,
-        });
-
-        // Create new reusable resources for the clone
-        let texture = self.device.create_texture(&self.texture_desc);
-        let texture_view = texture.create_view(&Default::default());
-
-        let u32_size = std::mem::size_of::<u32>() as u32;
-        let output_buffer_size = (u32_size * self.texture_size * self.texture_size) as wgpu::BufferAddress;
-        let output_buffer_desc = wgpu::BufferDescriptor {
-            size: output_buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::MAP_READ,
-            label: None,
-            mapped_at_creation: false,
-        };
-        let output_buffer = self.device.create_buffer(&output_buffer_desc);
-
-        FitnessCalc {
-            goal_image: self.goal_image.clone(),
-            device: self.device,
-            queue: self.queue,
-            texture_size: self.texture_size,
-            texture_desc: self.texture_desc.clone(),
-            render_pipeline,
-            texture,
-            texture_view,
-            output_buffer,
-            u32_size,
-            compute_pipeline: None,
-            compute_bind_group: None,
-            fitness_buffer: None,
-            goal_texture: None,
-            goal_texture_view: None,
-            use_gpu_fitness: false,
-            current_generation: 0,
-        }
+impl fmt::Debug for FitnessCalc {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "FitnessCalc({0}x{0})", self.inner.texture_size)
     }
-}
-
-fn substract_rgba(first: &image::Rgba<u8>, second: &image::Rgba<u8>) -> usize {
-    let mut diff = 0;
-    diff += (first[0] as i32 - second[0] as i32).abs() as usize;
-    diff += (first[1] as i32 - second[1] as i32).abs() as usize;
-    diff += (first[2] as i32 - second[2] as i32).abs() as usize;
-    diff += (first[3] as i32 - second[3] as i32).abs() as usize;
-    diff
 }
 
 fn generate_sign() -> i8 {
@@ -249,14 +153,14 @@ fn generate_sign() -> i8 {
     }
 }
 
-impl<'a> FitnessCalc<'a> {
-    pub fn new(
-        goal_image: GoalImage,
-        device: &'a wgpu::Device,
-        queue: &'a wgpu::Queue,
-    ) -> Self {
+
+impl FitnessCalc {
+    fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, goal_image: &GoalImage) -> Self {
         let texture_size = goal_image.goal_image.width();
-        let texture_desc = wgpu::TextureDescriptor {
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Fitness Render Target"),
             size: wgpu::Extent3d {
                 width: texture_size,
                 height: texture_size,
@@ -265,37 +169,35 @@ impl<'a> FitnessCalc<'a> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            label: None,
-        };
+            format: target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        });
+        let texture_view = texture.create_view(&Default::default());
 
-        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
+        let render_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+            label: Some("Render Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[],
-                push_constant_ranges: &[],
-            });
+        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
+            label: Some("Fitness Render Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &render_shader,
                 entry_point: "vs_main",
                 buffers: &[Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &render_shader,
                 entry_point: "fs_main",
                 targets: &[wgpu::ColorTargetState {
-                    format: texture_desc.format,
+                    format: target_format,
                     blend: Some(wgpu::BlendState {
                         alpha: wgpu::BlendComponent::OVER,
                         color: wgpu::BlendComponent::OVER,
@@ -308,11 +210,8 @@ impl<'a> FitnessCalc<'a> {
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: Some(wgpu::Face::Back),
-                // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
                 polygon_mode: wgpu::PolygonMode::Fill,
-                // Requires Features::DEPTH_CLIP_CONTROL
                 unclipped_depth: false,
-                // Requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
             depth_stencil: None,
@@ -321,101 +220,19 @@ impl<'a> FitnessCalc<'a> {
                 mask: !0,
                 alpha_to_coverage_enabled: true,
             },
-            // If the pipeline will be used with a multiview render pass, this
-            // indicates how many array layers the attachments will have.
             multiview: None,
         });
 
-        // Create reusable resources
-        let u32_size = std::mem::size_of::<u32>() as u32;
-        let texture = device.create_texture(&texture_desc);
-        let texture_view = texture.create_view(&Default::default());
-
-        let bytes_per_row = (u32_size * texture_size + 255) & !255;
-        let output_buffer_size = (bytes_per_row * texture_size) as wgpu::BufferAddress;
-        let output_buffer_desc = wgpu::BufferDescriptor {
-            size: output_buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST
-                // this tells wpgu that we want to read this buffer from the cpu
-                | wgpu::BufferUsages::MAP_READ,
-            label: None,
+        // Genome size is constant per run; MAX_VERTICES gives headroom for any
+        // future growth phase. Filled per call via queue.write_buffer.
+        let vertex_capacity = (MAX_VERTICES as u64) * std::mem::size_of::<Vertex>() as u64;
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Vertex Buffer"),
+            size: vertex_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        };
-        let output_buffer = device.create_buffer(&output_buffer_desc);
-
-        // Initialize GPU compute resources with default weights
-        // Weights will be updated during fitness calculation
-        // Use balanced scale weights as default (will be adaptive in future)
-        let (compute_pipeline_opt, compute_bind_group_opt, fitness_buffer_opt, goal_texture_opt, goal_texture_view_opt) =
-            Self::init_gpu_compute(&device, &queue, &goal_image, &texture_view, texture_size, 0.7, 0.3, 0.3, 0.4, 0.3);
-        
-        let use_gpu_fitness = compute_pipeline_opt.is_some();
-        
-        // Unwrap the options or use None values
-        let compute_pipeline = compute_pipeline_opt;
-        let compute_bind_group = compute_bind_group_opt;
-        let fitness_buffer = fitness_buffer_opt;
-        let goal_texture = goal_texture_opt;
-        let goal_texture_view = goal_texture_view_opt;
-        
-        FitnessCalc {
-            goal_image,
-            device,
-            queue,
-            texture_size,
-            texture_desc,
-            render_pipeline,
-            texture,
-            texture_view,
-            output_buffer,
-            u32_size,
-            compute_pipeline,
-            compute_bind_group,
-            fitness_buffer,
-            goal_texture,
-            goal_texture_view,
-            use_gpu_fitness,
-            current_generation: 0,
-        }
-    }
-}
-
-impl<'a> FitnessCalc<'a> {
-    fn init_gpu_compute(
-        device: &'a wgpu::Device,
-        queue: &'a wgpu::Queue,
-        goal_image: &GoalImage,
-        rendered_texture_view: &wgpu::TextureView,
-        texture_size: u32,
-        color_weight: f32,
-        structure_weight: f32,
-        scale_weight_0: f32,
-        scale_weight_1: f32,
-        scale_weight_2: f32,
-    ) -> (
-        Option<wgpu::ComputePipeline>,
-        Option<wgpu::BindGroup>,
-        Option<wgpu::Buffer>,
-        Option<wgpu::Texture>,
-        Option<wgpu::TextureView>,
-    ) {
-        // Load compute shader
-        let shader_source = include_str!("fitness.wgsl");
-        
-        let shader_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
-            label: Some("Fitness Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
-        
-        // Create compute pipeline
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Fitness Compute Pipeline"),
-            layout: None,
-            module: &shader_module,
-            entry_point: "main",
-        });
-        
-        // Create goal texture
+
         let goal_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Goal Texture"),
             size: wgpu::Extent3d {
@@ -426,16 +243,11 @@ impl<'a> FitnessCalc<'a> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // sRGB so sampling matches the rendered texture's color space (Rgba8UnormSrgb).
-            // Goal PNG bytes are sRGB-encoded; the format does the decode on read.
+            // Matches the render target so sampled values land in the same
+            // colour space when the compute shader reads them.
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         });
-        
-        let goal_texture_view = goal_texture.create_view(&Default::default());
-        
-        // Upload goal image data to GPU
-        let goal_image_data = goal_image.goal_image.as_raw();
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &goal_texture,
@@ -443,11 +255,11 @@ impl<'a> FitnessCalc<'a> {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            goal_image_data,
+            goal_image.goal_image.as_raw(),
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(std::num::NonZeroU32::new(texture_size * 4).unwrap()),
-                rows_per_image: Some(std::num::NonZeroU32::new(texture_size).unwrap()),
+                bytes_per_row: NonZeroU32::new(texture_size * 4),
+                rows_per_image: NonZeroU32::new(texture_size),
             },
             wgpu::Extent3d {
                 width: texture_size,
@@ -455,25 +267,41 @@ impl<'a> FitnessCalc<'a> {
                 depth_or_array_layers: 1,
             },
         );
-        
-        // Create fitness buffer - using a struct instead of array for storage class
-        let fitness_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Fitness Buffer"),
-            size: std::mem::size_of::<u32>() as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
+        let goal_texture_view = goal_texture.create_view(&Default::default());
+
+        let compute_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+            label: Some("Fitness Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("fitness.wgsl").into()),
         });
-        
-        // Create bind group
-        let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Fitness Compute Pipeline"),
+            layout: None,
+            module: &compute_shader,
+            entry_point: "main",
+        });
+
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Fitness Params"),
-            contents: bytemuck::cast_slice(&[texture_size, texture_size, 2u32, 0u32, 
-                (color_weight * 1000.0) as u32, (structure_weight * 1000.0) as u32,
-                (scale_weight_0 * 1000.0) as u32, (scale_weight_1 * 1000.0) as u32, (scale_weight_2 * 1000.0) as u32]),
+            contents: bytemuck::cast_slice(&[texture_size, texture_size, 0u32, 0u32]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let fitness_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fitness Accumulator"),
+            size: std::mem::size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fitness_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fitness Readback"),
+            size: std::mem::size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
+        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Fitness Bind Group"),
             layout: &bind_group_layout,
             entries: &[
@@ -491,7 +319,7 @@ impl<'a> FitnessCalc<'a> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(rendered_texture_view),
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -503,317 +331,111 @@ impl<'a> FitnessCalc<'a> {
                 },
             ],
         });
-        
-        (
-            Some(compute_pipeline),
-            Some(bind_group),
-            Some(fitness_buffer),
-            Some(goal_texture),
-            Some(goal_texture_view),
-        )
-    }
-    
-    /// Update generation counter for adaptive fitness
-    fn update_generation(&mut self, generation: u64) {
-        self.current_generation = generation;
-    }
-    
-    /// Get adaptive fitness weights based on current generation
-    fn get_adaptive_weights(&self) -> (f32, f32) {
-        if self.current_generation < 100 {
-            // Early generations: focus on coarse structure
-            (0.6, 0.4) // color, structure
-        } else if self.current_generation < 300 {
-            // Middle generations: balance
-            (0.5, 0.5)
-        } else {
-            // Late generations: refine details
-            (0.4, 0.6)
-        }
-    }
-    
-    /// Get adaptive scale weights based on current generation
-    fn get_adaptive_scale_weights(&self) -> (f32, f32, f32) {
-        if self.current_generation < 50 {
-            // Very early: focus on coarse scale (0.5)
-            (0.5, 0.3, 0.2) // scale 0.5, 0.75, 1.0
-        } else if self.current_generation < 150 {
-            // Early: balance coarse and medium scales
-            (0.4, 0.4, 0.2)
-        } else if self.current_generation < 300 {
-            // Middle: balance all scales
-            (0.3, 0.4, 0.3)
-        } else {
-            // Late: focus on fine details (1.0 scale)
-            (0.2, 0.3, 0.5)
-        }
-    }
-    
-    /// Calculate distance between two genomes for fitness sharing
-    fn genome_distance(a: &Vertices, b: &Vertices) -> f32 {
-        if a.len() != b.len() {
-            return 1.0; // Maximum distance if different lengths
-        }
-        
-        let mut total_distance = 0.0;
-        let vertex_count = a.len();
-        
-        for i in 0..vertex_count {
-            // Position distance (Euclidean)
-            let pos_diff_x = a[i].position[0] - b[i].position[0];
-            let pos_diff_y = a[i].position[1] - b[i].position[1];
-            let pos_diff_z = a[i].position[2] - b[i].position[2];
-            let pos_distance = (pos_diff_x * pos_diff_x + pos_diff_y * pos_diff_y + pos_diff_z * pos_diff_z).sqrt();
-            
-            // Color distance (Euclidean in RGBA space)
-            let color_diff_r = a[i].color[0] - b[i].color[0];
-            let color_diff_g = a[i].color[1] - b[i].color[1];
-            let color_diff_b = a[i].color[2] - b[i].color[2];
-            let color_diff_a = a[i].color[3] - b[i].color[3];
-            let color_distance = (color_diff_r * color_diff_r + color_diff_g * color_diff_g + 
-                                color_diff_b * color_diff_b + color_diff_a * color_diff_a).sqrt();
-            
-            // Combine position and color distances
-            total_distance += pos_distance * 0.6 + color_distance * 0.4;
-        }
-        
-        // Normalize by vertex count and number of components
-        total_distance / (vertex_count as f32 * 1.4) // 0.6 + 0.4 = 1.0, but normalized
-    }
-    
-    /// Apply diversity bonus to fitness values
-    fn apply_diversity_bonus(&self, population: &[Vertices], fitness_values: &mut [usize], rng: &mut impl Rng) {
-        let diversity_strength = 0.05; // 5% diversity bonus
-        
-        // Calculate average fitness
-        let avg_fitness: f32 = fitness_values.iter().map(|&f| f as f32).sum::<f32>() / fitness_values.len() as f32;
-        
-        for i in 0..population.len() {
-            // Calculate diversity score based on distance to other solutions
-            let mut diversity_score = 0.0;
-            let mut min_distance = f32::MAX;
-            
-            for j in 0..population.len() {
-                if i != j {
-                    let distance = Self::genome_distance(&population[i], &population[j]);
-                    if distance < min_distance {
-                        min_distance = distance;
-                    }
-                    diversity_score += distance;
-                }
-            }
-            
-            // Normalize diversity score
-            let normalized_diversity = min_distance / 0.5; // Target distance of 0.5
-            let diversity_bonus = (normalized_diversity * diversity_strength * avg_fitness).clamp(0.0, avg_fitness * 0.1);
-            
-            // Add small random component to break ties and maintain diversity
-            let random_component = rng.gen_range(0.0..avg_fitness * 0.01);
-            
-            fitness_values[i] = ((fitness_values[i] as f32) + diversity_bonus + random_component) as usize;
+
+        FitnessCalc {
+            inner: Arc::new(FitnessCalcInner {
+                device,
+                queue,
+                texture_size,
+                render_pipeline,
+                texture_view,
+                vertex_buffer,
+                vertex_capacity,
+                compute_pipeline,
+                compute_bind_group,
+                fitness_buffer,
+                fitness_readback,
+            }),
         }
     }
 }
 
-impl FitnessFunction<Vertices, usize> for FitnessCalc<'_> {
+impl FitnessFunction<Vertices, usize> for FitnessCalc {
     fn fitness_of(&self, vertices: &Vertices) -> usize {
-        let device = self.device;
-        let queue = self.queue;
-        let clear_color = wgpu::Color::BLACK;
-        // Use reusable resources
-        let texture_view = &self.texture_view;
-        let output_buffer = &self.output_buffer;
-
+        let inner = &*self.inner;
         let num_vertices = vertices.len() as u32;
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(vertices);
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX
-                | wgpu::BufferUsages::MAP_READ
-                | wgpu::BufferUsages::COPY_DST,
+        assert!(
+            (vertex_bytes.len() as u64) <= inner.vertex_capacity,
+            "Genome ({} bytes) exceeds preallocated vertex buffer ({} bytes)",
+            vertex_bytes.len(),
+            inner.vertex_capacity
+        );
+
+        // Stream the genome into the pre-allocated vertex buffer and reset the
+        // atomic accumulator to zero. Both are queue-side writes; no encoder needed.
+        inner.queue.write_buffer(&inner.vertex_buffer, 0, vertex_bytes);
+        inner.queue.write_buffer(&inner.fitness_buffer, 0, &0u32.to_le_bytes());
+
+        let mut encoder = inner.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Fitness Encoder"),
         });
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
         {
-            let render_pass_desc = wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Fitness Render Pass"),
                 color_attachments: &[wgpu::RenderPassColorAttachment {
-                    view: &texture_view,
+                    view: &inner.texture_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: true,
                     },
                 }],
                 depth_stencil_attachment: None,
-            };
-            let mut render_pass = encoder.begin_render_pass(&render_pass_desc);
-
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            });
+            render_pass.set_pipeline(&inner.render_pipeline);
+            render_pass.set_vertex_buffer(0, inner.vertex_buffer.slice(..));
             render_pass.draw(0..num_vertices, 0..1);
         }
-        encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                aspect: wgpu::TextureAspect::All,
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-            },
-            wgpu::ImageCopyBuffer {
-                buffer: &output_buffer,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: NonZeroU32::new((self.u32_size * self.texture_size + 255) & !255),
-                    rows_per_image: NonZeroU32::new(self.texture_size),
-                },
-            },
-            self.texture_desc.size,
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Fitness Compute Pass"),
+            });
+            compute_pass.set_pipeline(&inner.compute_pipeline);
+            compute_pass.set_bind_group(0, &inner.compute_bind_group, &[]);
+            let wg = (inner.texture_size + 7) / 8;
+            compute_pass.dispatch(wg, wg, 1);
+        }
+
+        encoder.copy_buffer_to_buffer(
+            &inner.fitness_buffer,
+            0,
+            &inner.fitness_readback,
+            0,
+            std::mem::size_of::<u32>() as u64,
         );
 
-        queue.submit(Some(encoder.finish()));
+        inner.queue.submit(iter::once(encoder.finish()));
 
-        let mut fitness_result: usize = 0;
+        // The only sync point per genome: 4 bytes back from the GPU.
+        let slice = inner.fitness_readback.slice(..);
+        let mapping = slice.map_async(wgpu::MapMode::Read);
+        inner.device.poll(wgpu::Maintain::Wait);
+        block_on(mapping).unwrap();
+        let raw = {
+            let data = slice.get_mapped_range();
+            u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+        };
+        inner.fitness_readback.unmap();
 
-        // Get adaptive weights based on current generation
-        let (color_weight, structure_weight) = self.get_adaptive_weights();
+        // raw is the sum over all pixels of (|dr|+|dg|+|db|) * 1000, with both
+        // textures sampled in linear-RGB (sRGB-decoded by the GPU on read).
+        let max_total = (inner.texture_size as f64).powi(2) * 3000.0;
+        let similarity = (1.0 - raw as f64 / max_total).max(0.0);
+        let mut fitness_value = (similarity * 1_000_000.0) as usize;
 
-        // Try to use GPU compute for fitness calculation if available
-        if self.use_gpu_fitness {
-            if let (Some(compute_pipeline), Some(compute_bind_group), Some(fitness_buffer), Some(goal_texture), Some(goal_texture_view)) = 
-                (&self.compute_pipeline, &self.compute_bind_group, &self.fitness_buffer, &self.goal_texture, &self.goal_texture_view) {
-                
-                // Copy the rendered texture to the goal texture format for compute shader
-                let mut compute_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-                
-                // Dispatch compute shader
-                {
-                    let mut compute_pass = compute_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("Fitness Compute Pass"),
-                    });
-                    compute_pass.set_pipeline(compute_pipeline);
-                    compute_pass.set_bind_group(0, compute_bind_group, &[]);
-                    
-                    // Dispatch with workgroup size matching the shader (8x8)
-                    let workgroup_size_x = (self.texture_size + 7) / 8; // ceil(texture_size / 8)
-                    let workgroup_size_y = (self.texture_size + 7) / 8;
-                    compute_pass.dispatch(workgroup_size_x, workgroup_size_y, 1);
-                }
-                
-                // Submit compute work
-                queue.submit(Some(compute_encoder.finish()));
-                
-                // Read back the fitness result from GPU
-                let fitness_buffer_slice = fitness_buffer.slice(..);
-                let fitness_mapping = fitness_buffer_slice.map_async(wgpu::MapMode::Read);
-                device.poll(wgpu::Maintain::Wait);
-                block_on(fitness_mapping).unwrap();
-                let fitness_data = fitness_buffer_slice.get_mapped_range();
-                
-                // Convert bytes to fitness value
-                if fitness_data.len() >= 4 {
-                    let fitness_bytes: [u8; 4] = [fitness_data[0], fitness_data[1], fitness_data[2], fitness_data[3]];
-                    fitness_result = u32::from_le_bytes(fitness_bytes) as usize;
-                }
-                
-                drop(fitness_data);
-                
-                // Apply bonuses for complexity
-                if vertices.len() > 100 {
-                    fitness_result += (vertices.len() as f32 * 10.0) as usize;
-                } else {
-                    fitness_result += (vertices.len() as f32 * 5.0) as usize;
-                }
-            }
+        // Legacy bonus that biases the GA toward keeping more triangles.
+        // Tier 3 should reconsider this.
+        if vertices.len() > 100 {
+            fitness_value += vertices.len() * 10;
         } else {
-            // Fallback to CPU-based fitness calculation
-            // We need to scope the mapping variables so that we can
-            // unmap the buffer
-            {
-                let buffer_slice = output_buffer.slice(..);
-
-                // NOTE: We have to create the mapping THEN device.poll() before await
-                // the future. Otherwise the application will freeze.
-                let mapping = buffer_slice.map_async(wgpu::MapMode::Read);
-                device.poll(wgpu::Maintain::Wait);
-                block_on(mapping).unwrap();
-                let data = buffer_slice.get_mapped_range();
-
-                let buffer =
-                    ImageBuffer::<Rgba<u8>, _>::from_raw(self.texture_size, self.texture_size, data).unwrap();
-                // Ultra-fast fitness calculation with aggressive sampling
-                let mut sampled_pixels = 0;
-                let goal_width = self.goal_image.goal_image.width();
-                let goal_height = self.goal_image.goal_image.height();
-                
-                // Aggressive sampling - larger steps for much faster evaluation
-                let sample_step = if vertices.len() < 100 { 4 } else { 3 };
-
-                // Sample the full image; previous 3/4 window let the bottom-right quadrant
-                // contribute nothing to fitness.
-                let sample_end_x = self.texture_size as u32;
-                let sample_end_y = self.texture_size as u32;
-
-                for y in (0..sample_end_y).step_by(sample_step) {
-                    for x in (0..sample_end_x).step_by(sample_step) {
-                        // Ensure we don't access out of bounds pixels
-                        let goal_x = x.min(goal_width - 1);
-                        let goal_y = y.min(goal_height - 1);
-                        let goal_pixel = self.goal_image.goal_image.get_pixel(goal_x, goal_y);
-                        let current_pixel = buffer.get_pixel(x, y);
-                        
-                        // Simplified difference calculation - focus on RGB only
-                        let diff = (
-                            (goal_pixel[0] as i32 - current_pixel[0] as i32).abs() +
-                            (goal_pixel[1] as i32 - current_pixel[1] as i32).abs() +
-                            (goal_pixel[2] as i32 - current_pixel[2] as i32).abs()
-                        ) as usize;
-                        
-                        fitness_result += diff;
-                        sampled_pixels += 1;
-                    }
-                }
-                
-                // Fast normalization with linear scaling
-                let max_possible_diff = sampled_pixels * (255 * 3); // RGB only
-                let fitness_normalized = 1.0 - (fitness_result as f32 / max_possible_diff as f32);
-                fitness_result = (fitness_normalized * 1000000.0) as usize;
-                
-                // Strongly reward solutions with more triangles to prevent premature simplification
-                // This encourages the algorithm to maintain complexity
-                if vertices.len() > 100 {
-                    fitness_result += (vertices.len() as f32 * 10.0) as usize; // 10x bonus
-                } else {
-                    fitness_result += (vertices.len() as f32 * 5.0) as usize; // 5x bonus
-                }
-
-                // let mut rng = thread_rng();
-                // let id: u32 = rng.gen_range(0..100);
-                // buffer.save(String::from("triangles/image") + &id.to_string() + ".png").unwrap();
-            }
-            output_buffer.unmap();
+            fitness_value += vertices.len() * 5;
         }
-        // let elapsed = now.elapsed();
-        // println!("Elapsed 3: {:.2?}", elapsed);
-        // let mut result: f32 = 0.0;
-        // //println!("{:?}", self.vertices);
-        // for (_, ver_q) in vertices.iter().enumerate() {
-        //     //println!("Vertex:  {:?}", ver_q);
-        //     for i in 0..3 {
-        //         result += ver_q.position[i];
-        //     }
 
-        //     for i in 0..4 {
-        //         result += ver_q.color[i];
-        //     }
-        // }
-
-        // let elapsed = now.elapsed();
-        // println!("Elapsed 3: {:.2?}", elapsed);
-        fitness_result
+        fitness_value
     }
 
     fn average(&self, values: &[usize]) -> usize {
@@ -821,7 +443,7 @@ impl FitnessFunction<Vertices, usize> for FitnessCalc<'_> {
     }
 
     fn highest_possible_fitness(&self) -> usize {
-        10000000
+        10_000_000
     }
 
     fn lowest_possible_fitness(&self) -> usize {
@@ -924,6 +546,8 @@ fn main() {
     }))
     .unwrap();
     let (device, queue) = block_on(adapter.request_device(&Default::default(), None)).unwrap();
+    let device = Arc::new(device);
+    let queue = Arc::new(queue);
 
     // let dssim = Dssim::new();
     let goal_image_image = image::open("goal.png").unwrap().into_rgba8();
@@ -938,7 +562,7 @@ fn main() {
     //     println!("Pixel: {:?}", i.0);
     // }
     let adjustment_size = 0.1;
-    let fitness_calc = FitnessCalc::new(goal_image.clone(), &device, &queue);
+    let fitness_calc = FitnessCalc::new(device.clone(), queue.clone(), &goal_image);
     
     // Sliding window of recent best-fitness values, used for convergence detection.
     let mut fitness_history: VecDeque<usize> = VecDeque::with_capacity(10);
