@@ -372,7 +372,8 @@ impl FitnessCalc {
         };
         inner.fitness_readback.unmap();
 
-        let max_total = (inner.texture_size as f64).powi(2) * 3000.0;
+        // Per-pixel: ΔE76 normalised to [0,1] and scaled to u32 by ×1000 (see fitness.wgsl).
+        let max_total = (inner.texture_size as f64).powi(2) * 1000.0;
         let similarity = (1.0 - raw as f64 / max_total).max(0.0);
         (similarity * 1_000_000.0) as usize
     }
