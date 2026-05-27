@@ -58,16 +58,15 @@ Extract the ES loop and its setup into a callable function so tests can exercise
 
 ```rust
 pub struct EsConfig {
+    pub phases: Vec<Phase>,           // matches the const PHASES schedule shape
     pub max_steps: u64,
     pub lambda: usize,
-    pub initial_triangles: usize,
-    pub initial_sigma: f32,
     pub snapshot_every: Option<u64>,  // None disables PNG snapshots in triangles/
 }
 
 pub struct EsResult {
-    pub initial_fitness: f64,
-    pub final_fitness: f64,
+    pub initial_fitness: usize,       // matches fitness_of() return type
+    pub final_fitness: usize,
     pub steps_run: u64,
 }
 
@@ -88,7 +87,9 @@ fn run_es(
 5. Call `run_es(...)`
 6. Print final fitness
 
-Existing module-level constants (`MAX_VERTICES`, `LAMBDA`, etc.) remain as module constants and serve as the production defaults referenced by `main()` when constructing its `EsConfig`. Only the five fields shown in the struct above (`max_steps`, `lambda`, `initial_triangles`, `initial_sigma`, `snapshot_every`) are surfaced as `EsConfig` fields — the smaller set that the smoke test needs to override. Other tunables (e.g., `SIGMA_WINDOW`, `PLATEAU_WINDOW`, `MAX_VERTICES`) stay as private module-level constants.
+The ES uses a multi-phase coarse-to-fine schedule defined in `const PHASES: &[Phase]` (line 476 of `main.rs`), where each `Phase` has `triangles`, `pyramid_level`, and `initial_sigma`. Production constructs `EsConfig { phases: PHASES.to_vec(), ... }`; the smoke test passes a single-element `Vec<Phase>`. Other tunables (`MAX_VERTICES`, `SIGMA_WINDOW`, `PLATEAU_WINDOW`, `SNAPSHOT_EVERY_IMPROVEMENT`) stay as private module-level constants — only the four fields above are surfaced because they are what the smoke test needs to override.
+
+**Fitness direction.** `FitnessCalc::fitness_of` (line 308) returns `usize` in `[0, 1_000_000]` where **higher = better fit**: the GPU sums per-pixel ΔE in CIELAB, then Rust converts to `1 - sum / max_total` and scales to `1_000_000`. The smoke test assertion direction is `final_fitness >= initial_fitness`.
 
 ### rand 0.8 → 0.10 migration
 
@@ -108,17 +109,17 @@ Added as `#[cfg(test)] mod tests` at the bottom of `src/polygenvo/main.rs`. Sing
 fn ga_improves_on_synthetic_checker() {
     let goal = make_checker_goal(32);                    // 32×32 RGBA checker
     let (device, queue) = futures::executor::block_on(init_test_wgpu());
+    let test_phases = vec![Phase { triangles: 6, pyramid_level: 0, initial_sigma: 0.1 }];
     let result = run_es(device, queue, goal, EsConfig {
+        phases: test_phases,
         max_steps: 30,
         lambda: 4,
-        initial_triangles: 6,
-        initial_sigma: 0.1,
         snapshot_every: None,
     });
-    assert!(result.initial_fitness.is_finite());
-    assert!(result.final_fitness.is_finite());
     assert!(result.steps_run > 0);
-    assert!(result.final_fitness <= result.initial_fitness);
+    assert!(result.final_fitness <= 1_000_000);
+    // higher fitness = better fit (see FitnessCalc::fitness_of doc).
+    assert!(result.final_fitness >= result.initial_fitness);
 }
 ```
 
