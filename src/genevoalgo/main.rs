@@ -22,7 +22,7 @@ impl GenomeBuilder<Vertices> for Pictures {
 		(0..NUM_VERTICES)
 			.map(|_| Vertex {
 				position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0],
-				color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
+				color: [rng.r#gen(), rng.r#gen(), rng.r#gen(), rng.r#gen()],
 			})
 			.collect()
 	}
@@ -88,7 +88,7 @@ impl RandomValueMutation for Vertex {
 	{
 		Vertex {
 			position: [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0],
-			color: [rng.gen(), rng.gen(), rng.gen(), rng.gen()],
+			color: [rng.r#gen(), rng.r#gen(), rng.r#gen(), rng.r#gen()],
 		}
 	}
 }
