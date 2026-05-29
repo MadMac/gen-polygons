@@ -657,7 +657,7 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
 fn load_goal_image(path: &str) -> GoalImage {
     let goal_image = GoalImage {
         goal_image: image::open(path)
-            .expect("goal.png missing in cwd")
+            .unwrap_or_else(|e| panic!("failed to open goal image at {path}: {e}"))
             .into_rgba8(),
     };
     println!(
