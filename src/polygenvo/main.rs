@@ -3,7 +3,6 @@ use image::{ImageBuffer, Rgba};
 use rand::prelude::*;
 use std::fmt;
 use std::iter;
-use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -123,37 +122,40 @@ impl FitnessCalc {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
         });
         let texture_view = texture.create_view(&Default::default());
 
-        let render_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Render Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Fitness Render Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &render_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &render_shader,
-                entry_point: "fs_main",
-                targets: &[wgpu::ColorTargetState {
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
                     blend: Some(wgpu::BlendState {
                         alpha: wgpu::BlendComponent::OVER,
                         color: wgpu::BlendComponent::OVER,
                     }),
                     write_mask: wgpu::ColorWrites::ALL,
-                }],
+                })],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -170,7 +172,8 @@ impl FitnessCalc {
                 mask: !0,
                 alpha_to_coverage_enabled: true,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         // Genome size is constant per run; MAX_VERTICES gives headroom for any
@@ -197,19 +200,20 @@ impl FitnessCalc {
             // colour space when the compute shader reads them.
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         });
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &goal_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             goal_image.goal_image.as_raw(),
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: NonZeroU32::new(texture_size * 4),
-                rows_per_image: NonZeroU32::new(texture_size),
+                bytes_per_row: Some(texture_size * 4),
+                rows_per_image: Some(texture_size),
             },
             wgpu::Extent3d {
                 width: texture_size,
@@ -219,7 +223,7 @@ impl FitnessCalc {
         );
         let goal_texture_view = goal_texture.create_view(&Default::default());
 
-        let compute_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Fitness Compute Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("fitness.wgsl").into()),
         });
@@ -227,7 +231,9 @@ impl FitnessCalc {
             label: Some("Fitness Compute Pipeline"),
             layout: None,
             module: &compute_shader,
-            entry_point: "main",
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
         });
 
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -327,15 +333,19 @@ impl FitnessCalc {
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Fitness Render Pass"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &inner.texture_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: true,
+                        store: wgpu::StoreOp::Store,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
             render_pass.set_pipeline(&inner.render_pipeline);
             render_pass.set_vertex_buffer(0, inner.vertex_buffer.slice(..));
@@ -345,11 +355,12 @@ impl FitnessCalc {
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Fitness Compute Pass"),
+                timestamp_writes: None,
             });
             compute_pass.set_pipeline(&inner.compute_pipeline);
             compute_pass.set_bind_group(0, &inner.compute_bind_group, &[]);
             let wg = (inner.texture_size + 7) / 8;
-            compute_pass.dispatch(wg, wg, 1);
+            compute_pass.dispatch_workgroups(wg, wg, 1);
         }
 
         encoder.copy_buffer_to_buffer(
@@ -363,9 +374,12 @@ impl FitnessCalc {
         inner.queue.submit(iter::once(encoder.finish()));
 
         let slice = inner.fitness_readback.slice(..);
-        let mapping = slice.map_async(wgpu::MapMode::Read);
-        inner.device.poll(wgpu::Maintain::Wait);
-        block_on(mapping).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
+        });
+        inner.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
         let raw = {
             let data = slice.get_mapped_range();
             u32::from_le_bytes([data[0], data[1], data[2], data[3]])
@@ -405,33 +419,37 @@ impl FitnessCalc {
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Snapshot Render Pass"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &inner.texture_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: true,
+                        store: wgpu::StoreOp::Store,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
             render_pass.set_pipeline(&inner.render_pipeline);
             render_pass.set_vertex_buffer(0, inner.vertex_buffer.slice(..));
             render_pass.draw(0..num_vertices, 0..1);
         }
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 aspect: wgpu::TextureAspect::All,
                 texture: &inner.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &output_buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: NonZeroU32::new(padded_bpr),
-                    rows_per_image: NonZeroU32::new(texture_size),
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(texture_size),
                 },
             },
             wgpu::Extent3d {
@@ -443,9 +461,12 @@ impl FitnessCalc {
         inner.queue.submit(iter::once(encoder.finish()));
 
         let slice = output_buffer.slice(..);
-        let mapping = slice.map_async(wgpu::MapMode::Read);
-        inner.device.poll(wgpu::Maintain::Wait);
-        block_on(mapping).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
+        });
+        inner.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
 
         // Strip row padding back to unpadded_bpr per row.
@@ -670,7 +691,13 @@ fn load_goal_image(path: &str) -> GoalImage {
 }
 
 pub async fn init_wgpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
-    let instance = wgpu::Instance::new(wgpu::Backends::GL);
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::GL,
+        flags: wgpu::InstanceFlags::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        memory_budget_thresholds: Default::default(),
+        display: Default::default(),
+    });
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -680,7 +707,14 @@ pub async fn init_wgpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
         .await
         .expect("no suitable wgpu adapter");
     let (device, queue) = adapter
-        .request_device(&Default::default(), None)
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        })
         .await
         .expect("device init failed");
     (Arc::new(device), Arc::new(queue))
