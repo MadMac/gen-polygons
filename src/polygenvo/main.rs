@@ -518,13 +518,13 @@ fn sample_goal_color(goal: &GoalImage, cx: f32, cy: f32, alpha: f32) -> [f32; 4]
 /// sampled from the goal at that point. Vertices are placed in CCW order so
 /// the rasteriser (front_face: Ccw, cull_mode: Back) keeps the triangle.
 fn random_color_seeded_triangle(goal: &GoalImage, rng: &mut impl Rng, max_radius: f32) -> [Vertex; 3] {
-    let cx = rng.gen_range(-0.9_f32..0.9);
-    let cy = rng.gen_range(-0.9_f32..0.9);
-    let radius = rng.gen_range(max_radius * 0.3..max_radius);
-    let alpha = rng.gen_range(0.25_f32..0.75);
+    let cx = rng.random_range(-0.9_f32..0.9);
+    let cy = rng.random_range(-0.9_f32..0.9);
+    let radius = rng.random_range(max_radius * 0.3..max_radius);
+    let alpha = rng.random_range(0.25_f32..0.75);
     let color = sample_goal_color(goal, cx, cy, alpha);
 
-    let base = rng.gen_range(0.0_f32..std::f32::consts::TAU);
+    let base = rng.random_range(0.0_f32..std::f32::consts::TAU);
     let third = std::f32::consts::TAU / 3.0;
     let mk = |theta: f32| Vertex {
         position: [cx + radius * theta.cos(), cy + radius * theta.sin(), 0.0],
@@ -563,24 +563,24 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
         return init_genome(goal, min_triangles, rng);
     }
 
-    let op = rng.gen_range(0u32..100);
+    let op = rng.random_range(0u32..100);
     match op {
         0..=39 => {
             // Nudge a single vertex of one triangle.
-            let t = rng.gen_range(0..n);
-            let v = rng.gen_range(0..3);
+            let t = rng.random_range(0..n);
+            let v = rng.random_range(0..3);
             let idx = t * 3 + v;
-            let dx = rng.gen_range(-sigma..sigma);
-            let dy = rng.gen_range(-sigma..sigma);
+            let dx = rng.random_range(-sigma..sigma);
+            let dy = rng.random_range(-sigma..sigma);
             child[idx].position[0] = (child[idx].position[0] + dx).clamp(-1.0, 1.0);
             child[idx].position[1] = (child[idx].position[1] + dy).clamp(-1.0, 1.0);
         }
         40..=64 => {
             // Recolour all three vertices of one triangle (RGB).
-            let t = rng.gen_range(0..n);
-            let dr = rng.gen_range(-sigma..sigma);
-            let dg = rng.gen_range(-sigma..sigma);
-            let db = rng.gen_range(-sigma..sigma);
+            let t = rng.random_range(0..n);
+            let dr = rng.random_range(-sigma..sigma);
+            let dg = rng.random_range(-sigma..sigma);
+            let db = rng.random_range(-sigma..sigma);
             for v in 0..3 {
                 let c = &mut child[t * 3 + v].color;
                 c[0] = (c[0] + dr).clamp(0.0, 1.0);
@@ -590,8 +590,8 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
         }
         65..=79 => {
             // Nudge the alpha of one triangle.
-            let t = rng.gen_range(0..n);
-            let da = rng.gen_range(-sigma..sigma);
+            let t = rng.random_range(0..n);
+            let da = rng.random_range(-sigma..sigma);
             for v in 0..3 {
                 let a = &mut child[t * 3 + v].color[3];
                 *a = (*a + da).clamp(0.0, 1.0);
@@ -600,7 +600,7 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
         80..=89 => {
             // Swap z-order with a neighbouring triangle.
             if n > 1 {
-                let t = rng.gen_range(0..n - 1);
+                let t = rng.random_range(0..n - 1);
                 for v in 0..3 {
                     child.swap(t * 3 + v, (t + 1) * 3 + v);
                 }
@@ -610,7 +610,7 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
             // Add a new colour-seeded triangle at a random z position.
             if n < max_triangles {
                 let tri = random_color_seeded_triangle(goal, rng, 0.2);
-                let insert_at = rng.gen_range(0..=n) * 3;
+                let insert_at = rng.random_range(0..=n) * 3;
                 for (offset, vert) in tri.iter().enumerate() {
                     child.insert(insert_at + offset, *vert);
                 }
@@ -619,7 +619,7 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
         _ => {
             // Delete one triangle.
             if n > min_triangles {
-                let t = rng.gen_range(0..n);
+                let t = rng.random_range(0..n);
                 for _ in 0..3 {
                     child.remove(t * 3);
                 }
@@ -659,7 +659,7 @@ fn main() {
     let pyramid = build_pyramid(&device, &queue, &goal_image);
     let full_res = pyramid.len() - 1; // index of full-resolution level (for snapshots)
 
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
 
     // ---- Phase 0: initialise the genome at the first phase's triangle count ----
     let mut phase_idx: usize = 0;
