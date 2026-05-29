@@ -3,7 +3,6 @@ use image::{ImageBuffer, Rgba};
 use rand::prelude::*;
 use std::fmt;
 use std::iter;
-use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,7 +29,7 @@ const PLATEAU_ACCEPTS: u64 = 5;
 const SNAPSHOT_EVERY_IMPROVEMENT: u64 = 100;
 
 // Hard cap on total ES steps (sanity).
-const MAX_STEPS: u64 = 200_000;
+const MAX_STEPS: u64 = 500_000;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable, PartialEq, PartialOrd)]
@@ -60,7 +59,7 @@ impl Vertex {
     }
 }
 
-struct GoalImage {
+pub struct GoalImage {
     goal_image: image::ImageBuffer<image::Rgba<u8>, std::vec::Vec<u8>>,
 }
 
@@ -123,37 +122,40 @@ impl FitnessCalc {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
         });
         let texture_view = texture.create_view(&Default::default());
 
-        let render_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Render Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Fitness Render Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &render_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &render_shader,
-                entry_point: "fs_main",
-                targets: &[wgpu::ColorTargetState {
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
                     blend: Some(wgpu::BlendState {
                         alpha: wgpu::BlendComponent::OVER,
                         color: wgpu::BlendComponent::OVER,
                     }),
                     write_mask: wgpu::ColorWrites::ALL,
-                }],
+                })],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -170,7 +172,8 @@ impl FitnessCalc {
                 mask: !0,
                 alpha_to_coverage_enabled: true,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         // Genome size is constant per run; MAX_VERTICES gives headroom for any
@@ -197,19 +200,20 @@ impl FitnessCalc {
             // colour space when the compute shader reads them.
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         });
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &goal_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             goal_image.goal_image.as_raw(),
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: NonZeroU32::new(texture_size * 4),
-                rows_per_image: NonZeroU32::new(texture_size),
+                bytes_per_row: Some(texture_size * 4),
+                rows_per_image: Some(texture_size),
             },
             wgpu::Extent3d {
                 width: texture_size,
@@ -219,7 +223,7 @@ impl FitnessCalc {
         );
         let goal_texture_view = goal_texture.create_view(&Default::default());
 
-        let compute_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Fitness Compute Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("fitness.wgsl").into()),
         });
@@ -227,7 +231,9 @@ impl FitnessCalc {
             label: Some("Fitness Compute Pipeline"),
             layout: None,
             module: &compute_shader,
-            entry_point: "main",
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
         });
 
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -327,15 +333,19 @@ impl FitnessCalc {
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Fitness Render Pass"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &inner.texture_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: true,
+                        store: wgpu::StoreOp::Store,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
             render_pass.set_pipeline(&inner.render_pipeline);
             render_pass.set_vertex_buffer(0, inner.vertex_buffer.slice(..));
@@ -345,11 +355,12 @@ impl FitnessCalc {
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Fitness Compute Pass"),
+                timestamp_writes: None,
             });
             compute_pass.set_pipeline(&inner.compute_pipeline);
             compute_pass.set_bind_group(0, &inner.compute_bind_group, &[]);
             let wg = (inner.texture_size + 7) / 8;
-            compute_pass.dispatch(wg, wg, 1);
+            compute_pass.dispatch_workgroups(wg, wg, 1);
         }
 
         encoder.copy_buffer_to_buffer(
@@ -363,9 +374,12 @@ impl FitnessCalc {
         inner.queue.submit(iter::once(encoder.finish()));
 
         let slice = inner.fitness_readback.slice(..);
-        let mapping = slice.map_async(wgpu::MapMode::Read);
-        inner.device.poll(wgpu::Maintain::Wait);
-        block_on(mapping).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
+        });
+        inner.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
         let raw = {
             let data = slice.get_mapped_range();
             u32::from_le_bytes([data[0], data[1], data[2], data[3]])
@@ -405,33 +419,37 @@ impl FitnessCalc {
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Snapshot Render Pass"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &inner.texture_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: true,
+                        store: wgpu::StoreOp::Store,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
             render_pass.set_pipeline(&inner.render_pipeline);
             render_pass.set_vertex_buffer(0, inner.vertex_buffer.slice(..));
             render_pass.draw(0..num_vertices, 0..1);
         }
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 aspect: wgpu::TextureAspect::All,
                 texture: &inner.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &output_buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: NonZeroU32::new(padded_bpr),
-                    rows_per_image: NonZeroU32::new(texture_size),
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(texture_size),
                 },
             },
             wgpu::Extent3d {
@@ -443,9 +461,12 @@ impl FitnessCalc {
         inner.queue.submit(iter::once(encoder.finish()));
 
         let slice = output_buffer.slice(..);
-        let mapping = slice.map_async(wgpu::MapMode::Read);
-        inner.device.poll(wgpu::Maintain::Wait);
-        block_on(mapping).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
+        });
+        inner.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
 
         // Strip row padding back to unpadded_bpr per row.
@@ -466,7 +487,8 @@ impl FitnessCalc {
 
 // ---- (1+λ)-ES support: phases, mutation operators, initial seeding ----
 
-struct Phase {
+#[derive(Clone)]
+pub struct Phase {
     triangles: usize,
     pyramid_level: usize,
     // Initial sigma for this phase. Self-adapted by the 1/5 rule from here.
@@ -479,6 +501,30 @@ const PHASES: &[Phase] = &[
     Phase { triangles: 120, pyramid_level: 2, initial_sigma: 0.10 },  // 512² fine
     Phase { triangles: 150, pyramid_level: 2, initial_sigma: 0.05 },  // 512² finer
 ];
+
+pub struct EsConfig {
+    pub phases: Vec<Phase>,
+    pub max_steps: u64,
+    pub lambda: usize,
+    pub snapshot_every: Option<u64>,
+}
+
+impl EsConfig {
+    fn production() -> Self {
+        Self {
+            phases: PHASES.to_vec(),
+            max_steps: MAX_STEPS,
+            lambda: LAMBDA,
+            snapshot_every: Some(SNAPSHOT_EVERY_IMPROVEMENT),
+        }
+    }
+}
+
+pub struct EsResult {
+    pub initial_fitness: usize,
+    pub final_fitness: usize,
+    pub steps_run: u64,
+}
 
 /// Downsample the goal image to the given square size using a Lanczos filter.
 fn downsample_goal(full: &GoalImage, size: u32) -> GoalImage {
@@ -518,13 +564,13 @@ fn sample_goal_color(goal: &GoalImage, cx: f32, cy: f32, alpha: f32) -> [f32; 4]
 /// sampled from the goal at that point. Vertices are placed in CCW order so
 /// the rasteriser (front_face: Ccw, cull_mode: Back) keeps the triangle.
 fn random_color_seeded_triangle(goal: &GoalImage, rng: &mut impl Rng, max_radius: f32) -> [Vertex; 3] {
-    let cx = rng.gen_range(-0.9_f32..0.9);
-    let cy = rng.gen_range(-0.9_f32..0.9);
-    let radius = rng.gen_range(max_radius * 0.3..max_radius);
-    let alpha = rng.gen_range(0.25_f32..0.75);
+    let cx = rng.random_range(-0.9_f32..0.9);
+    let cy = rng.random_range(-0.9_f32..0.9);
+    let radius = rng.random_range(max_radius * 0.3..max_radius);
+    let alpha = rng.random_range(0.25_f32..0.75);
     let color = sample_goal_color(goal, cx, cy, alpha);
 
-    let base = rng.gen_range(0.0_f32..std::f32::consts::TAU);
+    let base = rng.random_range(0.0_f32..std::f32::consts::TAU);
     let third = std::f32::consts::TAU / 3.0;
     let mk = |theta: f32| Vertex {
         position: [cx + radius * theta.cos(), cy + radius * theta.sin(), 0.0],
@@ -563,24 +609,24 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
         return init_genome(goal, min_triangles, rng);
     }
 
-    let op = rng.gen_range(0u32..100);
+    let op = rng.random_range(0u32..100);
     match op {
         0..=39 => {
             // Nudge a single vertex of one triangle.
-            let t = rng.gen_range(0..n);
-            let v = rng.gen_range(0..3);
+            let t = rng.random_range(0..n);
+            let v = rng.random_range(0..3);
             let idx = t * 3 + v;
-            let dx = rng.gen_range(-sigma..sigma);
-            let dy = rng.gen_range(-sigma..sigma);
+            let dx = rng.random_range(-sigma..sigma);
+            let dy = rng.random_range(-sigma..sigma);
             child[idx].position[0] = (child[idx].position[0] + dx).clamp(-1.0, 1.0);
             child[idx].position[1] = (child[idx].position[1] + dy).clamp(-1.0, 1.0);
         }
         40..=64 => {
             // Recolour all three vertices of one triangle (RGB).
-            let t = rng.gen_range(0..n);
-            let dr = rng.gen_range(-sigma..sigma);
-            let dg = rng.gen_range(-sigma..sigma);
-            let db = rng.gen_range(-sigma..sigma);
+            let t = rng.random_range(0..n);
+            let dr = rng.random_range(-sigma..sigma);
+            let dg = rng.random_range(-sigma..sigma);
+            let db = rng.random_range(-sigma..sigma);
             for v in 0..3 {
                 let c = &mut child[t * 3 + v].color;
                 c[0] = (c[0] + dr).clamp(0.0, 1.0);
@@ -590,8 +636,8 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
         }
         65..=79 => {
             // Nudge the alpha of one triangle.
-            let t = rng.gen_range(0..n);
-            let da = rng.gen_range(-sigma..sigma);
+            let t = rng.random_range(0..n);
+            let da = rng.random_range(-sigma..sigma);
             for v in 0..3 {
                 let a = &mut child[t * 3 + v].color[3];
                 *a = (*a + da).clamp(0.0, 1.0);
@@ -600,7 +646,7 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
         80..=89 => {
             // Swap z-order with a neighbouring triangle.
             if n > 1 {
-                let t = rng.gen_range(0..n - 1);
+                let t = rng.random_range(0..n - 1);
                 for v in 0..3 {
                     child.swap(t * 3 + v, (t + 1) * 3 + v);
                 }
@@ -610,7 +656,7 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
             // Add a new colour-seeded triangle at a random z position.
             if n < max_triangles {
                 let tri = random_color_seeded_triangle(goal, rng, 0.2);
-                let insert_at = rng.gen_range(0..=n) * 3;
+                let insert_at = rng.random_range(0..=n) * 3;
                 for (offset, vert) in tri.iter().enumerate() {
                     child.insert(insert_at + offset, *vert);
                 }
@@ -619,7 +665,7 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
         _ => {
             // Delete one triangle.
             if n > min_triangles {
-                let t = rng.gen_range(0..n);
+                let t = rng.random_range(0..n);
                 for _ in 0..3 {
                     child.remove(t * 3);
                 }
@@ -629,50 +675,75 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
     child
 }
 
-fn main() {
-    env_logger::init();
-
-    // ---- GPU setup ----
-    let instance = wgpu::Instance::new(wgpu::Backends::GL);
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))
-    .expect("no suitable wgpu adapter");
-    let (device, queue) = block_on(adapter.request_device(&Default::default(), None))
-        .expect("device init failed");
-    let device = Arc::new(device);
-    let queue = Arc::new(queue);
-
-    // ---- Goal image + pyramid ----
+fn load_goal_image(path: &str) -> GoalImage {
     let goal_image = GoalImage {
-        goal_image: image::open("goal.png")
-            .expect("goal.png missing in cwd")
+        goal_image: image::open(path)
+            .unwrap_or_else(|e| panic!("failed to open goal image at {path}: {e}"))
             .into_rgba8(),
     };
     println!(
-        "Loaded goal.png ({}x{})",
+        "Loaded {} ({}x{})",
+        path,
         goal_image.goal_image.width(),
         goal_image.goal_image.height()
     );
-    let pyramid = build_pyramid(&device, &queue, &goal_image);
+    goal_image
+}
+
+pub async fn init_wgpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::GL,
+        flags: wgpu::InstanceFlags::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        memory_budget_thresholds: Default::default(),
+        display: Default::default(),
+    });
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .expect("no suitable wgpu adapter");
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        })
+        .await
+        .expect("device init failed");
+    (Arc::new(device), Arc::new(queue))
+}
+
+pub fn run_es(
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    goal: GoalImage,
+    cfg: EsConfig,
+) -> EsResult {
+    let pyramid = build_pyramid(&device, &queue, &goal);
     let full_res = pyramid.len() - 1; // index of full-resolution level (for snapshots)
 
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
 
     // ---- Phase 0: initialise the genome at the first phase's triangle count ----
     let mut phase_idx: usize = 0;
-    let mut current = init_genome(&goal_image, PHASES[phase_idx].triangles, &mut rng);
-    let mut sigma = PHASES[phase_idx].initial_sigma;
-    let mut current_fitness = pyramid[PHASES[phase_idx].pyramid_level].fitness_of(&current);
+    let mut current = init_genome(&goal, cfg.phases[phase_idx].triangles, &mut rng);
+    let mut sigma = cfg.phases[phase_idx].initial_sigma;
+    let mut current_fitness = pyramid[cfg.phases[phase_idx].pyramid_level].fitness_of(&current);
+    let initial_fitness = current_fitness;
 
     println!(
         "Phase {} | {} triangles | level {} ({}²) | σ={:.3} | starting fitness {}",
         phase_idx,
-        PHASES[phase_idx].triangles,
-        PHASES[phase_idx].pyramid_level,
-        pyramid[PHASES[phase_idx].pyramid_level].inner.texture_size,
+        cfg.phases[phase_idx].triangles,
+        cfg.phases[phase_idx].pyramid_level,
+        pyramid[cfg.phases[phase_idx].pyramid_level].inner.texture_size,
         sigma,
         current_fitness
     );
@@ -689,11 +760,13 @@ fn main() {
 
     // Trigger a snapshot of the initial state at full resolution so the
     // triangles/ directory has something to compare against.
-    let _ = std::fs::create_dir_all("triangles");
-    pyramid[full_res].snapshot(&current, Path::new("triangles/image0.png"));
+    if let Some(_) = cfg.snapshot_every {
+        let _ = std::fs::create_dir_all("triangles");
+        pyramid[full_res].snapshot(&current, Path::new("triangles/image0.png"));
+    }
 
-    while step < MAX_STEPS {
-        let phase = &PHASES[phase_idx];
+    while step < cfg.max_steps {
+        let phase = &cfg.phases[phase_idx];
         let calc = &pyramid[phase.pyramid_level];
         // Hold the genome near this phase's target. Allow ~25% shrinkage so
         // add/delete can shuffle the composition, but don't let add grow past
@@ -704,9 +777,9 @@ fn main() {
         // (1+λ): produce λ candidates, keep the best if it beats the parent.
         let mut best_idx: Option<usize> = None;
         let mut best_fit = current_fitness;
-        let mut candidates: Vec<Vec<Vertex>> = Vec::with_capacity(LAMBDA);
-        for _ in 0..LAMBDA {
-            let c = mutate(&current, sigma, min_triangles, max_triangles, &goal_image, &mut rng);
+        let mut candidates: Vec<Vec<Vertex>> = Vec::with_capacity(cfg.lambda);
+        for _ in 0..cfg.lambda {
+            let c = mutate(&current, sigma, min_triangles, max_triangles, &goal, &mut rng);
             let f = calc.fitness_of(&c);
             if f > best_fit {
                 best_fit = f;
@@ -741,9 +814,11 @@ fn main() {
         }
 
         // Snapshot occasionally on improvement.
-        if accepted && improvements_total > 0 && improvements_total % SNAPSHOT_EVERY_IMPROVEMENT == 0 {
-            let path_buf = format!("triangles/image{}.png", step);
-            pyramid[full_res].snapshot(&current, Path::new(&path_buf));
+        if let Some(snap_every) = cfg.snapshot_every {
+            if accepted && improvements_total > 0 && improvements_total % snap_every == 0 {
+                let path_buf = format!("triangles/image{}.png", step);
+                pyramid[full_res].snapshot(&current, Path::new(&path_buf));
+            }
         }
 
         // Periodic progress log (rate-limited so output stays readable).
@@ -767,10 +842,10 @@ fn main() {
         if phase_step >= PHASE_MIN_STEPS && phase_step % PLATEAU_WINDOW == 0 {
             let plateaued = accepts_in_plateau_window < PLATEAU_ACCEPTS;
             accepts_in_plateau_window = 0;
-            if plateaued && phase_idx + 1 < PHASES.len() {
+            if plateaued && phase_idx + 1 < cfg.phases.len() {
                 phase_idx += 1;
-                let new_phase = &PHASES[phase_idx];
-                grow_genome(&mut current, new_phase.triangles, &goal_image, &mut rng);
+                let new_phase = &cfg.phases[phase_idx];
+                grow_genome(&mut current, new_phase.triangles, &goal, &mut rng);
                 sigma = new_phase.initial_sigma;
                 // Re-score against the new (possibly higher-resolution) pyramid level.
                 current_fitness = pyramid[new_phase.pyramid_level].fitness_of(&current);
@@ -785,8 +860,10 @@ fn main() {
                     current_fitness
                 );
                 // Snapshot the new phase's starting frame.
-                let path_buf = format!("triangles/image{}_phase{}.png", step, phase_idx);
-                pyramid[full_res].snapshot(&current, Path::new(&path_buf));
+                if let Some(_) = cfg.snapshot_every {
+                    let path_buf = format!("triangles/image{}_phase{}.png", step, phase_idx);
+                    pyramid[full_res].snapshot(&current, Path::new(&path_buf));
+                }
             }
         }
     }
@@ -798,6 +875,99 @@ fn main() {
         improvements_total,
         current_fitness
     );
-    pyramid[full_res].snapshot(&current, Path::new("triangles/final.png"));
+    if let Some(_) = cfg.snapshot_every {
+        pyramid[full_res].snapshot(&current, Path::new("triangles/final.png"));
+    }
+
+    EsResult {
+        initial_fitness,
+        final_fitness: current_fitness,
+        steps_run: step,
+    }
 }
 
+fn main() {
+    env_logger::init();
+    let goal = load_goal_image("goal.png");
+    let (device, queue) = block_on(init_wgpu());
+    let cfg = EsConfig::production();
+    let result = run_es(device, queue, goal, cfg);
+    println!(
+        "Done. Initial fitness: {}, final fitness: {}, steps: {}",
+        result.initial_fitness, result.final_fitness, result.steps_run
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageBuffer, Rgba};
+
+    fn make_checker_goal(size: u32) -> GoalImage {
+        // Construct a black/white checker pattern at the requested resolution.
+        let mut buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(size, size);
+        let cell = (size / 4).max(1);  // 4×4 logical cells; min 1px
+        for y in 0..size {
+            for x in 0..size {
+                let on = ((x / cell) + (y / cell)) % 2 == 0;
+                let v = if on { 255 } else { 0 };
+                buf.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        GoalImage { goal_image: buf }
+    }
+
+    fn init_test_wgpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
+        // Reuse the main init_wgpu helper; same backends/preferences as production.
+        block_on(init_wgpu())
+    }
+
+    #[test]
+    fn ga_improves_on_synthetic_checker() {
+        let goal = make_checker_goal(32);
+        let (device, queue) = init_test_wgpu();
+        // Single-phase config for the test. pyramid_level 0 is the coarsest
+        // level (build_pyramid sizes = [full/4, full/2, full]); for a 32×32
+        // goal this evaluates at 8×8 — fast and plenty for a smoke test.
+        let test_phases = vec![Phase {
+            triangles: 6,
+            pyramid_level: 0,
+            initial_sigma: 0.1,
+        }];
+        let result = run_es(
+            device,
+            queue,
+            goal,
+            EsConfig {
+                phases: test_phases,
+                max_steps: 30,
+                lambda: 4,
+                snapshot_every: None,
+            },
+        );
+        assert!(
+            result.steps_run > 0,
+            "ES loop must run at least one step"
+        );
+        // fitness_of returns usize in [0, 1_000_000] where HIGHER = better fit.
+        // A stuck-at-zero result usually means the GPU pipeline returned
+        // garbage (e.g., a bind-group or texture-format mismatch silently
+        // produced an empty render) — that's the most likely silent failure
+        // mode of the wgpu migration, so guard against it explicitly.
+        assert!(
+            result.final_fitness > 0,
+            "fitness stuck at zero — pipeline likely broken"
+        );
+        assert!(
+            result.final_fitness <= 1_000_000,
+            "fitness out of expected range: {}",
+            result.final_fitness
+        );
+        assert!(
+            result.final_fitness >= result.initial_fitness,
+            "fitness should not regress: initial={}, final={}",
+            result.initial_fitness,
+            result.final_fitness
+        );
+    }
+}

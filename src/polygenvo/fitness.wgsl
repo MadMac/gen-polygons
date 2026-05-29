@@ -12,26 +12,26 @@
 // same single-u32 readback.
 
 struct FitnessParams {
-    image_width: u32;
-    image_height: u32;
-    pad0: u32;
-    pad1: u32;
-};
+    image_width: u32,
+    image_height: u32,
+    pad0: u32,
+    pad1: u32,
+}
 
 struct FitnessResult {
-    value: atomic<u32>;
-};
+    value: atomic<u32>,
+}
 
-[[group(0), binding(0)]]
+@group(0) @binding(0)
 var<uniform> params: FitnessParams;
 
-[[group(0), binding(1)]]
+@group(0) @binding(1)
 var goal_texture: texture_2d<f32>;
 
-[[group(0), binding(2)]]
+@group(0) @binding(2)
 var rendered_texture: texture_2d<f32>;
 
-[[group(0), binding(3)]]
+@group(0) @binding(3)
 var<storage, read_write> fitness_result: FitnessResult;
 
 // Linear-RGB (sRGB primaries, D65) -> CIE XYZ
@@ -59,8 +59,8 @@ fn xyz_to_lab(xyz: vec3<f32>) -> vec3<f32> {
     );
 }
 
-[[stage(compute), workgroup_size(8, 8, 1)]]
-fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let x = global_id.x;
     let y = global_id.y;
     if (x >= params.image_width || y >= params.image_height) {
