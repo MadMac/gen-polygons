@@ -864,6 +864,18 @@ pub fn run_es(
                     let path_buf = format!("triangles/image{}_phase{}.png", step, phase_idx);
                     pyramid[full_res].snapshot(&current, Path::new(&path_buf));
                 }
+            } else if plateaued {
+                // No further phases to promote to. Kick σ back to this phase's
+                // initial_sigma so the search re-explores instead of grinding
+                // at near-zero step size. Reset phase_step so the next plateau
+                // evaluation waits another PHASE_MIN_STEPS + PLATEAU_WINDOW.
+                let old_sigma = sigma;
+                sigma = phase.initial_sigma;
+                phase_step = 0;
+                println!(
+                    "⤴ Sigma restart (no further phases) | σ {:.3} → {:.3}",
+                    old_sigma, sigma
+                );
             }
         }
     }
