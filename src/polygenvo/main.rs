@@ -598,6 +598,18 @@ fn grow_genome(genome: &mut Vec<Vertex>, target_triangles: usize, goal: &GoalIma
     }
 }
 
+/// One sample from N(0, sigma) via the Box-Muller transform. `rand 0.10` ships no
+/// normal distribution and we avoid adding `rand_distr`, so we derive it from two
+/// uniforms. Gaussian (vs the previous uniform) perturbations give the ES both
+/// fine refinement (most mass near 0) and an occasional larger exploratory jump
+/// (the tail) — the previous uniform jitter had no tail.
+fn gaussian(rng: &mut impl Rng, sigma: f32) -> f32 {
+    let u1: f32 = rng.random_range(1e-7_f32..1.0); // avoid ln(0)
+    let u2: f32 = rng.random_range(0.0_f32..1.0);
+    let mag = (-2.0 * u1.ln()).sqrt();
+    mag * (std::f32::consts::TAU * u2).cos() * sigma
+}
+
 /// Apply one random mutation to a clone of `parent`. Operator probabilities
 /// are roughly tuned for polygon-image evolution: small local changes dominate,
 /// structural changes (add/delete/z-swap) happen rarely.
@@ -914,6 +926,8 @@ fn main() {
 mod tests {
     use super::*;
     use image::{ImageBuffer, Rgba};
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     fn make_checker_goal(size: u32) -> GoalImage {
         // Construct a black/white checker pattern at the requested resolution.
@@ -932,6 +946,18 @@ mod tests {
     fn init_test_wgpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
         // Reuse the main init_wgpu helper; same backends/preferences as production.
         block_on(init_wgpu())
+    }
+
+    #[test]
+    fn gaussian_has_zero_mean_and_unit_std() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let n = 100_000;
+        let samples: Vec<f32> = (0..n).map(|_| gaussian(&mut rng, 1.0)).collect();
+        let mean: f32 = samples.iter().sum::<f32>() / n as f32;
+        let var: f32 = samples.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
+        let std = var.sqrt();
+        assert!(mean.abs() < 0.05, "mean {mean} not ~0");
+        assert!((std - 1.0).abs() < 0.05, "std {std} not ~1");
     }
 
     #[test]
