@@ -50,6 +50,21 @@ const GRID_CELLS: usize = (ERROR_GRID_DIM * ERROR_GRID_DIM) as usize; // 256
 const SLOT_PAYLOAD: u64 = 4 + (GRID_CELLS as u64) * 4; // 1028 bytes
 const SLOT_STRIDE: u64 = SLOT_PAYLOAD.div_ceil(256) * 256; // 1280 bytes
 
+// Per-type self-adapted step-size clamps. Position lives in clip-space [-1,1];
+// colour/alpha in [0,1], so they get independent ranges.
+const SIGMA_POS_MIN: f32 = 0.005;
+const SIGMA_POS_MAX: f32 = 0.5;
+const SIGMA_COL_MIN: f32 = 0.003;
+const SIGMA_COL_MAX: f32 = 0.4;
+
+/// Which step size a mutation exercises, for per-type 1/5-rule adaptation.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum OpKind {
+    Positional, // vertex nudge -> sigma_pos
+    Chromatic,  // recolour / alpha -> sigma_col
+    Structural, // add / delete / z-swap / relocate -> no step size
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable, PartialEq, PartialOrd)]
 struct Vertex {
@@ -578,15 +593,16 @@ impl FitnessCalc {
 pub struct Phase {
     triangles: usize,
     pyramid_level: usize,
-    // Initial sigma for this phase. Self-adapted by the 1/5 rule from here.
-    initial_sigma: f32,
+    // Initial step sizes for this phase, self-adapted by per-type 1/5 rules.
+    initial_sigma_pos: f32,
+    initial_sigma_col: f32,
 }
 
 const PHASES: &[Phase] = &[
-    Phase { triangles: 40,  pyramid_level: 0, initial_sigma: 0.25 },  // 128² coarse
-    Phase { triangles: 80,  pyramid_level: 1, initial_sigma: 0.15 },  // 256² medium
-    Phase { triangles: 120, pyramid_level: 2, initial_sigma: 0.10 },  // 512² fine
-    Phase { triangles: 150, pyramid_level: 2, initial_sigma: 0.05 },  // 512² finer
+    Phase { triangles: 40,  pyramid_level: 0, initial_sigma_pos: 0.30, initial_sigma_col: 0.20 }, // 128² coarse
+    Phase { triangles: 80,  pyramid_level: 1, initial_sigma_pos: 0.18, initial_sigma_col: 0.12 }, // 256² medium
+    Phase { triangles: 120, pyramid_level: 2, initial_sigma_pos: 0.10, initial_sigma_col: 0.08 }, // 512² fine
+    Phase { triangles: 150, pyramid_level: 2, initial_sigma_pos: 0.05, initial_sigma_col: 0.04 }, // 512² finer
 ];
 
 pub struct EsConfig {
@@ -697,50 +713,60 @@ fn gaussian(rng: &mut impl Rng, sigma: f32) -> f32 {
     mag * (std::f32::consts::TAU * u2).cos() * sigma
 }
 
-/// Apply one random mutation to a clone of `parent`. Operator probabilities
-/// are roughly tuned for polygon-image evolution: small local changes dominate,
-/// structural changes (add/delete/z-swap) happen rarely.
-fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: usize, goal: &GoalImage, rng: &mut impl Rng) -> Vec<Vertex> {
+/// Apply one random mutation to a clone of `parent`, returning the child and the
+/// `OpKind` it exercised (for per-type step-size adaptation). Positional nudges
+/// use `sigma_pos`; recolour/alpha use `sigma_col`; both are Gaussian. Structural
+/// changes (add/delete/z-swap) happen rarely and carry no step size.
+fn mutate(
+    parent: &[Vertex],
+    sigma_pos: f32,
+    sigma_col: f32,
+    min_triangles: usize,
+    max_triangles: usize,
+    goal: &GoalImage,
+    rng: &mut impl Rng,
+) -> (Vec<Vertex>, OpKind) {
     let mut child = parent.to_vec();
     let n = child.len() / 3;
     if n == 0 {
         // Pathological: rebuild from scratch.
-        return init_genome(goal, min_triangles, rng);
+        return (init_genome(goal, min_triangles, rng), OpKind::Structural);
     }
 
     let op = rng.random_range(0u32..100);
-    match op {
+    let kind = match op {
         0..=39 => {
-            // Nudge a single vertex of one triangle.
+            // Nudge a single vertex of one triangle (Gaussian, sigma_pos).
             let t = rng.random_range(0..n);
             let v = rng.random_range(0..3);
             let idx = t * 3 + v;
-            let dx = rng.random_range(-sigma..sigma);
-            let dy = rng.random_range(-sigma..sigma);
-            child[idx].position[0] = (child[idx].position[0] + dx).clamp(-1.0, 1.0);
-            child[idx].position[1] = (child[idx].position[1] + dy).clamp(-1.0, 1.0);
+            child[idx].position[0] = (child[idx].position[0] + gaussian(rng, sigma_pos)).clamp(-1.0, 1.0);
+            child[idx].position[1] = (child[idx].position[1] + gaussian(rng, sigma_pos)).clamp(-1.0, 1.0);
+            OpKind::Positional
         }
         40..=64 => {
-            // Recolour all three vertices of one triangle (RGB).
+            // Recolour all three vertices of one triangle (RGB, Gaussian, sigma_col).
             let t = rng.random_range(0..n);
-            let dr = rng.random_range(-sigma..sigma);
-            let dg = rng.random_range(-sigma..sigma);
-            let db = rng.random_range(-sigma..sigma);
+            let dr = gaussian(rng, sigma_col);
+            let dg = gaussian(rng, sigma_col);
+            let db = gaussian(rng, sigma_col);
             for v in 0..3 {
                 let c = &mut child[t * 3 + v].color;
                 c[0] = (c[0] + dr).clamp(0.0, 1.0);
                 c[1] = (c[1] + dg).clamp(0.0, 1.0);
                 c[2] = (c[2] + db).clamp(0.0, 1.0);
             }
+            OpKind::Chromatic
         }
         65..=79 => {
-            // Nudge the alpha of one triangle.
+            // Nudge the alpha of one triangle (Gaussian, sigma_col).
             let t = rng.random_range(0..n);
-            let da = rng.random_range(-sigma..sigma);
+            let da = gaussian(rng, sigma_col);
             for v in 0..3 {
                 let a = &mut child[t * 3 + v].color[3];
                 *a = (*a + da).clamp(0.0, 1.0);
             }
+            OpKind::Chromatic
         }
         80..=89 => {
             // Swap z-order with a neighbouring triangle.
@@ -750,6 +776,7 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
                     child.swap(t * 3 + v, (t + 1) * 3 + v);
                 }
             }
+            OpKind::Structural
         }
         90..=94 => {
             // Add a new colour-seeded triangle at a random z position.
@@ -760,6 +787,7 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
                     child.insert(insert_at + offset, *vert);
                 }
             }
+            OpKind::Structural
         }
         _ => {
             // Delete one triangle.
@@ -769,9 +797,10 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
                     child.remove(t * 3);
                 }
             }
+            OpKind::Structural
         }
-    }
-    child
+    };
+    (child, kind)
 }
 
 fn load_goal_image(path: &str) -> GoalImage {
@@ -833,25 +862,32 @@ pub fn run_es(
     // ---- Phase 0: initialise the genome at the first phase's triangle count ----
     let mut phase_idx: usize = 0;
     let mut current = init_genome(&goal, cfg.phases[phase_idx].triangles, &mut rng);
-    let mut sigma = cfg.phases[phase_idx].initial_sigma;
+    let mut sigma_pos = cfg.phases[phase_idx].initial_sigma_pos;
+    let mut sigma_col = cfg.phases[phase_idx].initial_sigma_col;
     let mut current_fitness = pyramid[cfg.phases[phase_idx].pyramid_level].fitness_of(&current);
     let initial_fitness = current_fitness;
 
     println!(
-        "Phase {} | {} triangles | level {} ({}²) | σ={:.3} | starting fitness {}",
+        "Phase {} | {} triangles | level {} ({}²) | σ_pos={:.3} σ_col={:.3} | starting fitness {}",
         phase_idx,
         cfg.phases[phase_idx].triangles,
         cfg.phases[phase_idx].pyramid_level,
         pyramid[cfg.phases[phase_idx].pyramid_level].inner.texture_size,
-        sigma,
+        sigma_pos,
+        sigma_col,
         current_fitness
     );
 
     // ---- ES state ----
     let mut step: u64 = 0;
     let mut phase_step: u64 = 0;
-    let mut accepts_in_sigma_window: u64 = 0;
+    // Per-type 1/5 rule: count candidates generated and how many beat the parent,
+    // separately for positional and chromatic mutations, over SIGMA_WINDOW steps.
     let mut steps_in_sigma_window: u64 = 0;
+    let mut pos_gen: u64 = 0;
+    let mut pos_better: u64 = 0;
+    let mut col_gen: u64 = 0;
+    let mut col_better: u64 = 0;
     let mut accepts_in_plateau_window: u64 = 0;
     let mut improvements_total: u64 = 0;
     let started = Instant::now();
@@ -875,14 +911,31 @@ pub fn run_es(
 
         // (1+λ): produce λ candidates and evaluate them all in one GPU submit.
         let mut candidates: Vec<Vec<Vertex>> = Vec::with_capacity(cfg.lambda);
+        let mut kinds: Vec<OpKind> = Vec::with_capacity(cfg.lambda);
         for _ in 0..cfg.lambda {
-            candidates.push(mutate(&current, sigma, min_triangles, max_triangles, &goal, &mut rng));
+            let (child, kind) = mutate(
+                &current, sigma_pos, sigma_col, min_triangles, max_triangles, &goal, &mut rng,
+            );
+            candidates.push(child);
+            kinds.push(kind);
         }
         let cand_refs: Vec<&[Vertex]> = candidates.iter().map(|c| c.as_slice()).collect();
         let evals = calc.fitness_of_batch(&cand_refs);
         let mut best_idx: Option<usize> = None;
         let mut best_fit = current_fitness;
         for (i, e) in evals.iter().enumerate() {
+            match kinds[i] {
+                OpKind::Positional => pos_gen += 1,
+                OpKind::Chromatic => col_gen += 1,
+                OpKind::Structural => {}
+            }
+            if e.score > current_fitness {
+                match kinds[i] {
+                    OpKind::Positional => pos_better += 1,
+                    OpKind::Chromatic => col_better += 1,
+                    OpKind::Structural => {}
+                }
+            }
             if e.score > best_fit {
                 best_fit = e.score;
                 best_idx = Some(i);
@@ -893,7 +946,6 @@ pub fn run_es(
         if let Some(i) = best_idx {
             current = candidates.swap_remove(i);
             current_fitness = best_fit;
-            accepts_in_sigma_window += 1;
             accepts_in_plateau_window += 1;
             improvements_total += 1;
             accepted = true;
@@ -902,16 +954,30 @@ pub fn run_es(
         step += 1;
         phase_step += 1;
 
-        // 1/5 success rule: maintain ~20% acceptance rate.
+        // Per-type 1/5 success rule: adapt each step size toward a ~20%
+        // beat-the-parent rate, independently, over SIGMA_WINDOW steps.
         if steps_in_sigma_window >= SIGMA_WINDOW {
-            let rate = accepts_in_sigma_window as f32 / steps_in_sigma_window as f32;
-            if rate > 0.2 {
-                sigma = (sigma * 1.15).min(0.5);
-            } else if rate < 0.2 {
-                sigma = (sigma * 0.85).max(0.005);
+            if pos_gen > 0 {
+                let rate = pos_better as f32 / pos_gen as f32;
+                if rate > 0.2 {
+                    sigma_pos = (sigma_pos * 1.15).min(SIGMA_POS_MAX);
+                } else if rate < 0.2 {
+                    sigma_pos = (sigma_pos * 0.85).max(SIGMA_POS_MIN);
+                }
+            }
+            if col_gen > 0 {
+                let rate = col_better as f32 / col_gen as f32;
+                if rate > 0.2 {
+                    sigma_col = (sigma_col * 1.15).min(SIGMA_COL_MAX);
+                } else if rate < 0.2 {
+                    sigma_col = (sigma_col * 0.85).max(SIGMA_COL_MIN);
+                }
             }
             steps_in_sigma_window = 0;
-            accepts_in_sigma_window = 0;
+            pos_gen = 0;
+            pos_better = 0;
+            col_gen = 0;
+            col_better = 0;
         }
 
         // Snapshot occasionally on improvement.
@@ -925,11 +991,12 @@ pub fn run_es(
         // Periodic progress log (rate-limited so output stays readable).
         if last_log.elapsed().as_secs_f32() >= 1.0 {
             println!(
-                "step {:>6} | phase {} | tris {:>3} | σ={:.3} | fit {:>7} | improvements {} | {:.1}/s",
+                "step {:>6} | phase {} | tris {:>3} | σ_pos={:.3} σ_col={:.3} | fit {:>7} | improvements {} | {:.1}/s",
                 step,
                 phase_idx,
                 current.len() / 3,
-                sigma,
+                sigma_pos,
+                sigma_col,
                 current_fitness,
                 improvements_total,
                 step as f64 / started.elapsed().as_secs_f64()
@@ -947,17 +1014,26 @@ pub fn run_es(
                 phase_idx += 1;
                 let new_phase = &cfg.phases[phase_idx];
                 grow_genome(&mut current, new_phase.triangles, &goal, &mut rng);
-                sigma = new_phase.initial_sigma;
+                sigma_pos = new_phase.initial_sigma_pos;
+                sigma_col = new_phase.initial_sigma_col;
                 // Re-score against the new (possibly higher-resolution) pyramid level.
                 current_fitness = pyramid[new_phase.pyramid_level].fitness_of(&current);
                 phase_step = 0;
+                // Clear the 1/5-rule window so the first adaptation window after the
+                // transition doesn't mix stale old-phase stats with new-phase candidates.
+                steps_in_sigma_window = 0;
+                pos_gen = 0;
+                pos_better = 0;
+                col_gen = 0;
+                col_better = 0;
                 println!(
-                    "→ Phase {} | {} triangles | level {} ({}²) | σ={:.3} | re-scored fitness {}",
+                    "→ Phase {} | {} triangles | level {} ({}²) | σ_pos={:.3} σ_col={:.3} | re-scored fitness {}",
                     phase_idx,
                     new_phase.triangles,
                     new_phase.pyramid_level,
                     pyramid[new_phase.pyramid_level].inner.texture_size,
-                    sigma,
+                    sigma_pos,
+                    sigma_col,
                     current_fitness
                 );
                 // Snapshot the new phase's starting frame.
@@ -966,16 +1042,24 @@ pub fn run_es(
                     pyramid[full_res].snapshot(&current, Path::new(&path_buf));
                 }
             } else if plateaued {
-                // No further phases to promote to. Kick σ back to this phase's
-                // initial_sigma so the search re-explores instead of grinding
-                // at near-zero step size. Reset phase_step so the next plateau
-                // evaluation waits another PHASE_MIN_STEPS + PLATEAU_WINDOW.
-                let old_sigma = sigma;
-                sigma = phase.initial_sigma;
+                // No further phases to promote to. Kick both σ back to this
+                // phase's initial sizes so the search re-explores instead of
+                // grinding at near-zero step size. Reset phase_step so the next
+                // plateau evaluation waits another PHASE_MIN_STEPS + PLATEAU_WINDOW.
+                let (old_pos, old_col) = (sigma_pos, sigma_col);
+                sigma_pos = phase.initial_sigma_pos;
+                sigma_col = phase.initial_sigma_col;
                 phase_step = 0;
+                // Clear the 1/5-rule window so the first adaptation window after the
+                // restart doesn't mix stale stats with post-restart candidates.
+                steps_in_sigma_window = 0;
+                pos_gen = 0;
+                pos_better = 0;
+                col_gen = 0;
+                col_better = 0;
                 println!(
-                    "⤴ Sigma restart (no further phases) | σ {:.3} → {:.3}",
-                    old_sigma, sigma
+                    "⤴ Sigma restart (no further phases) | σ_pos {:.3}→{:.3} σ_col {:.3}→{:.3}",
+                    old_pos, sigma_pos, old_col, sigma_col
                 );
             }
         }
@@ -1103,7 +1187,8 @@ mod tests {
         let test_phases = vec![Phase {
             triangles: 6,
             pyramid_level: 0,
-            initial_sigma: 0.1,
+            initial_sigma_pos: 0.1,
+            initial_sigma_col: 0.1,
         }];
         let result = run_es(
             device,
