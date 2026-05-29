@@ -60,7 +60,7 @@ impl Vertex {
     }
 }
 
-struct GoalImage {
+pub struct GoalImage {
     goal_image: image::ImageBuffer<image::Rgba<u8>, std::vec::Vec<u8>>,
 }
 
@@ -892,8 +892,9 @@ mod tests {
     fn ga_improves_on_synthetic_checker() {
         let goal = make_checker_goal(32);
         let (device, queue) = init_test_wgpu();
-        // Single-phase config for the test. pyramid_level: 0 means full-res
-        // (no downsampling); for a 32×32 goal this is fine.
+        // Single-phase config for the test. pyramid_level 0 is the coarsest
+        // level (build_pyramid sizes = [full/4, full/2, full]); for a 32×32
+        // goal this evaluates at 8×8 — fast and plenty for a smoke test.
         let test_phases = vec![Phase {
             triangles: 6,
             pyramid_level: 0,
