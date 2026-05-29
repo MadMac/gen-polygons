@@ -48,6 +48,7 @@ fn xyz_to_lab(xyz: vec3<f32>) -> vec3<f32> {
     let xn = xyz.x / 0.95047;
     let yn = xyz.y / 1.00000;
     let zn = xyz.z / 1.08883;
+    // The piecewise f() that splits the cube-root for small inputs.
     let fx = select((7.787 * xn) + (16.0 / 116.0), pow(xn, 1.0 / 3.0), xn > 0.008856);
     let fy = select((7.787 * yn) + (16.0 / 116.0), pow(yn, 1.0 / 3.0), yn > 0.008856);
     let fz = select((7.787 * zn) + (16.0 / 116.0), pow(zn, 1.0 / 3.0), zn > 0.008856);
@@ -75,6 +76,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let d = goal_lab - rendered_lab;
     let delta_e = sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
 
+    // ΔE76 between primary-saturated colours peaks around ~230. Normalise
+    // by 250 to map most realistic pairs into [0, 1], then scale by 1000
+    // so atomicAdd<u32> can accumulate at integer precision. Per-pixel
+    // contribution is in [0, ~1000]; for 1024² that's ~1B << u32::MAX.
     let normalized = clamp(delta_e / 250.0, 0.0, 1.0);
     atomicAdd(&fitness_result.value, u32(normalized * 1000.0));
 }
