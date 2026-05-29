@@ -713,6 +713,58 @@ fn gaussian(rng: &mut impl Rng, sigma: f32) -> f32 {
     mag * (std::f32::consts::TAU * u2).cos() * sigma
 }
 
+/// Roulette-select a grid cell index with probability proportional to its error
+/// weight. Falls back to uniform when the grid is all-zero (e.g. a perfect match).
+fn sample_error_cell(grid: &[u32], rng: &mut impl Rng) -> usize {
+    let total: u64 = grid.iter().map(|&w| w as u64).sum();
+    if total == 0 {
+        return rng.random_range(0..grid.len());
+    }
+    let mut pick = rng.random_range(0..total);
+    for (i, &w) in grid.iter().enumerate() {
+        let w = w as u64;
+        if pick < w {
+            return i;
+        }
+        pick -= w;
+    }
+    grid.len() - 1
+}
+
+/// Map an error-grid cell plus intra-cell jitter (`jx`, `jy` in [0,1]) to a
+/// clip-space point in [-1,1]². Cell row 0 is the top of the image, so clip y is
+/// flipped to match (the fitness shader bins with row 0 = top).
+fn cell_to_clip(cell: usize, jx: f32, jy: f32) -> (f32, f32) {
+    let g = ERROR_GRID_DIM as f32;
+    let gx = (cell % ERROR_GRID_DIM as usize) as f32;
+    let gy = (cell / ERROR_GRID_DIM as usize) as f32;
+    let u = (gx + jx) / g; // [0,1] across the image width
+    let v = (gy + jy) / g; // [0,1] top→bottom
+    (u * 2.0 - 1.0, 1.0 - v * 2.0)
+}
+
+/// Like `random_color_seeded_triangle`, but the centre is drawn from a high-error
+/// grid cell rather than uniformly across the canvas.
+fn error_seeded_triangle(
+    goal: &GoalImage,
+    error_grid: &[u32],
+    rng: &mut impl Rng,
+    max_radius: f32,
+) -> [Vertex; 3] {
+    let cell = sample_error_cell(error_grid, rng);
+    let (cx, cy) = cell_to_clip(cell, rng.random_range(0.0..1.0), rng.random_range(0.0..1.0));
+    let radius = rng.random_range(max_radius * 0.3..max_radius);
+    let alpha = rng.random_range(0.25_f32..0.75);
+    let color = sample_goal_color(goal, cx, cy, alpha);
+    let base = rng.random_range(0.0_f32..std::f32::consts::TAU);
+    let third = std::f32::consts::TAU / 3.0;
+    let mk = |theta: f32| Vertex {
+        position: [cx + radius * theta.cos(), cy + radius * theta.sin(), 0.0],
+        color,
+    };
+    [mk(base), mk(base + third), mk(base + 2.0 * third)]
+}
+
 /// Apply one random mutation to a clone of `parent`, returning the child and the
 /// `OpKind` it exercised (for per-type step-size adaptation). Positional nudges
 /// use `sigma_pos`; recolour/alpha use `sigma_col`; both are Gaussian. Structural
@@ -724,6 +776,7 @@ fn mutate(
     min_triangles: usize,
     max_triangles: usize,
     goal: &GoalImage,
+    error_grid: &[u32],
     rng: &mut impl Rng,
 ) -> (Vec<Vertex>, OpKind) {
     let mut child = parent.to_vec();
@@ -758,7 +811,7 @@ fn mutate(
             }
             OpKind::Chromatic
         }
-        65..=79 => {
+        65..=77 => {
             // Nudge the alpha of one triangle (Gaussian, sigma_col).
             let t = rng.random_range(0..n);
             let da = gaussian(rng, sigma_col);
@@ -768,7 +821,7 @@ fn mutate(
             }
             OpKind::Chromatic
         }
-        80..=89 => {
+        78..=85 => {
             // Swap z-order with a neighbouring triangle.
             if n > 1 {
                 let t = rng.random_range(0..n - 1);
@@ -778,10 +831,10 @@ fn mutate(
             }
             OpKind::Structural
         }
-        90..=94 => {
-            // Add a new colour-seeded triangle at a random z position.
+        86..=91 => {
+            // Add a new triangle seeded in a high-error region.
             if n < max_triangles {
-                let tri = random_color_seeded_triangle(goal, rng, 0.2);
+                let tri = error_seeded_triangle(goal, error_grid, rng, 0.2);
                 let insert_at = rng.random_range(0..=n) * 3;
                 for (offset, vert) in tri.iter().enumerate() {
                     child.insert(insert_at + offset, *vert);
@@ -789,8 +842,49 @@ fn mutate(
             }
             OpKind::Structural
         }
+        92..=95 => {
+            // Relocate an existing triangle's centroid to a high-error cell and
+            // recolour it to that region — recycles triangles that aren't helping.
+            let t = rng.random_range(0..n);
+            let base = t * 3;
+            let cell = sample_error_cell(error_grid, rng);
+            let (tx, ty) =
+                cell_to_clip(cell, rng.random_range(0.0..1.0), rng.random_range(0.0..1.0));
+            let ccx = (child[base].position[0]
+                + child[base + 1].position[0]
+                + child[base + 2].position[0])
+                / 3.0;
+            let ccy = (child[base].position[1]
+                + child[base + 1].position[1]
+                + child[base + 2].position[1])
+                / 3.0;
+            let (dx, dy) = (tx - ccx, ty - ccy);
+            // Move + clamp first, then recolour from the triangle's actual
+            // post-clamp centroid: near the border a vertex can clamp, so the
+            // landed centroid differs from the target (tx, ty) and we want the
+            // colour of where the triangle actually ends up.
+            for v in 0..3 {
+                child[base + v].position[0] = (child[base + v].position[0] + dx).clamp(-1.0, 1.0);
+                child[base + v].position[1] = (child[base + v].position[1] + dy).clamp(-1.0, 1.0);
+            }
+            let acx = (child[base].position[0]
+                + child[base + 1].position[0]
+                + child[base + 2].position[0])
+                / 3.0;
+            let acy = (child[base].position[1]
+                + child[base + 1].position[1]
+                + child[base + 2].position[1])
+                / 3.0;
+            let col = sample_goal_color(goal, acx, acy, child[base].color[3]);
+            for v in 0..3 {
+                child[base + v].color[0] = col[0];
+                child[base + v].color[1] = col[1];
+                child[base + v].color[2] = col[2];
+            }
+            OpKind::Structural
+        }
         _ => {
-            // Delete one triangle.
+            // Delete one triangle (op in 96..=99).
             if n > min_triangles {
                 let t = rng.random_range(0..n);
                 for _ in 0..3 {
@@ -864,7 +958,14 @@ pub fn run_es(
     let mut current = init_genome(&goal, cfg.phases[phase_idx].triangles, &mut rng);
     let mut sigma_pos = cfg.phases[phase_idx].initial_sigma_pos;
     let mut sigma_col = cfg.phases[phase_idx].initial_sigma_col;
-    let mut current_fitness = pyramid[cfg.phases[phase_idx].pyramid_level].fitness_of(&current);
+    let mut current_fitness;
+    let mut parent_error_grid: Vec<u32>;
+    {
+        let mut e = pyramid[cfg.phases[phase_idx].pyramid_level].fitness_of_batch(&[current.as_slice()]);
+        let ev = e.swap_remove(0);
+        current_fitness = ev.score;
+        parent_error_grid = ev.error_grid;
+    }
     let initial_fitness = current_fitness;
 
     println!(
@@ -914,7 +1015,8 @@ pub fn run_es(
         let mut kinds: Vec<OpKind> = Vec::with_capacity(cfg.lambda);
         for _ in 0..cfg.lambda {
             let (child, kind) = mutate(
-                &current, sigma_pos, sigma_col, min_triangles, max_triangles, &goal, &mut rng,
+                &current, sigma_pos, sigma_col, min_triangles, max_triangles, &goal,
+                &parent_error_grid, &mut rng,
             );
             candidates.push(child);
             kinds.push(kind);
@@ -944,6 +1046,7 @@ pub fn run_es(
 
         let mut accepted = false;
         if let Some(i) = best_idx {
+            parent_error_grid = evals[i].error_grid.clone();
             current = candidates.swap_remove(i);
             current_fitness = best_fit;
             accepts_in_plateau_window += 1;
@@ -1017,7 +1120,12 @@ pub fn run_es(
                 sigma_pos = new_phase.initial_sigma_pos;
                 sigma_col = new_phase.initial_sigma_col;
                 // Re-score against the new (possibly higher-resolution) pyramid level.
-                current_fitness = pyramid[new_phase.pyramid_level].fitness_of(&current);
+                {
+                    let mut e = pyramid[new_phase.pyramid_level].fitness_of_batch(&[current.as_slice()]);
+                    let ev = e.swap_remove(0);
+                    current_fitness = ev.score;
+                    parent_error_grid = ev.error_grid;
+                }
                 phase_step = 0;
                 // Clear the 1/5-rule window so the first adaptation window after the
                 // transition doesn't mix stale old-phase stats with new-phase candidates.
@@ -1175,6 +1283,37 @@ mod tests {
         let sum_black: u64 = eb.error_grid.iter().map(|&w| w as u64).sum();
         assert!(ew.error_grid.iter().all(|&w| w > 0), "white goal: every cell should have error");
         assert!(sum_white > sum_black * 10, "white {sum_white} should dwarf black {sum_black}");
+    }
+
+    #[test]
+    fn sample_error_cell_favours_high_error() {
+        // Cell 2 dominates; with a fixed seed it should be picked almost always.
+        let grid = vec![0u32, 0, 100, 0];
+        let mut rng = StdRng::seed_from_u64(1);
+        let hits = (0..1000).filter(|_| sample_error_cell(&grid, &mut rng) == 2).count();
+        assert!(hits >= 999, "dominant cell chosen {hits}/1000");
+    }
+
+    #[test]
+    fn sample_error_cell_uniform_when_empty() {
+        // All-zero grid -> uniform fallback over the four cells.
+        let grid = vec![0u32; 4];
+        let mut rng = StdRng::seed_from_u64(2);
+        let mut counts = [0usize; 4];
+        for _ in 0..4000 {
+            counts[sample_error_cell(&grid, &mut rng)] += 1;
+        }
+        assert!(counts.iter().all(|&c| c > 700), "not roughly uniform: {counts:?}");
+    }
+
+    #[test]
+    fn cell_to_clip_stays_in_cell_bounds() {
+        // For ERROR_GRID_DIM=16, cell 0 is the top-left; its clip-x spans
+        // [-1, -1 + 2/16] and clip-y spans [1 - 2/16, 1].
+        let g = ERROR_GRID_DIM as f32;
+        let (cx, cy) = cell_to_clip(0, 0.5, 0.5);
+        assert!(cx >= -1.0 && cx <= -1.0 + 2.0 / g, "cx {cx} out of cell 0");
+        assert!(cy <= 1.0 && cy >= 1.0 - 2.0 / g, "cy {cy} out of cell 0");
     }
 
     #[test]
