@@ -669,7 +669,7 @@ fn load_goal_image(path: &str) -> GoalImage {
     goal_image
 }
 
-async fn init_wgpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
+pub async fn init_wgpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
     let instance = wgpu::Instance::new(wgpu::Backends::GL);
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -686,7 +686,7 @@ async fn init_wgpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
     (Arc::new(device), Arc::new(queue))
 }
 
-fn run_es(
+pub fn run_es(
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     goal: GoalImage,
@@ -864,3 +864,67 @@ fn main() {
     );
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageBuffer, Rgba};
+
+    fn make_checker_goal(size: u32) -> GoalImage {
+        // Construct a black/white checker pattern at the requested resolution.
+        let mut buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(size, size);
+        let cell = (size / 4).max(1);  // 4×4 logical cells; min 1px
+        for y in 0..size {
+            for x in 0..size {
+                let on = ((x / cell) + (y / cell)) % 2 == 0;
+                let v = if on { 255 } else { 0 };
+                buf.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        GoalImage { goal_image: buf }
+    }
+
+    fn init_test_wgpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
+        // Reuse the main init_wgpu helper; same backends/preferences as production.
+        block_on(init_wgpu())
+    }
+
+    #[test]
+    fn ga_improves_on_synthetic_checker() {
+        let goal = make_checker_goal(32);
+        let (device, queue) = init_test_wgpu();
+        // Single-phase config for the test. pyramid_level: 0 means full-res
+        // (no downsampling); for a 32×32 goal this is fine.
+        let test_phases = vec![Phase {
+            triangles: 6,
+            pyramid_level: 0,
+            initial_sigma: 0.1,
+        }];
+        let result = run_es(
+            device,
+            queue,
+            goal,
+            EsConfig {
+                phases: test_phases,
+                max_steps: 30,
+                lambda: 4,
+                snapshot_every: None,
+            },
+        );
+        assert!(
+            result.steps_run > 0,
+            "ES loop must run at least one step"
+        );
+        // fitness_of returns usize in [0, 1_000_000] where HIGHER = better fit.
+        assert!(
+            result.final_fitness <= 1_000_000,
+            "fitness out of expected range: {}",
+            result.final_fitness
+        );
+        assert!(
+            result.final_fitness >= result.initial_fitness,
+            "fitness should not regress: initial={}, final={}",
+            result.initial_fitness,
+            result.final_fitness
+        );
+    }
+}
