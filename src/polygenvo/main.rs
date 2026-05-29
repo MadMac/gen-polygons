@@ -3,6 +3,7 @@ use image::{ImageBuffer, Rgba};
 use rand::prelude::*;
 use std::fmt;
 use std::iter;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,6 +31,24 @@ const SNAPSHOT_EVERY_IMPROVEMENT: u64 = 100;
 
 // Hard cap on total ES steps (sanity).
 const MAX_STEPS: u64 = 500_000;
+
+// Per-pixel ΔE accumulator scale. Bounded by u32: largest pyramid level is
+// 512² = 262144 px, and 262144 * FITNESS_SCALE must stay < 2^32, so the safe
+// ceiling is ~16384. 8192 is 8× finer than the previous 1000 with headroom.
+// Passed to the shader via the params uniform so the Rust normaliser and the
+// shader share one source of truth.
+const FITNESS_SCALE: u32 = 8192;
+
+// Coarse residual-error grid emitted by the fitness pass for error-guided
+// placement. MUST equal `GRID_DIM` in fitness.wgsl (WGSL array sizes must be
+// compile-time constants, so the value is mirrored rather than passed).
+const ERROR_GRID_DIM: u32 = 16;
+const GRID_CELLS: usize = (ERROR_GRID_DIM * ERROR_GRID_DIM) as usize; // 256
+
+// Per-candidate GPU output: one score u32 + GRID_CELLS grid u32. Storage-buffer
+// binding offsets must be 256-aligned, so each slot is padded to SLOT_STRIDE.
+const SLOT_PAYLOAD: u64 = 4 + (GRID_CELLS as u64) * 4; // 1028 bytes
+const SLOT_STRIDE: u64 = SLOT_PAYLOAD.div_ceil(256) * 256; // 1280 bytes
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable, PartialEq, PartialOrd)]
@@ -77,6 +96,15 @@ impl fmt::Debug for GoalImage {
     }
 }
 
+/// Result of scoring one candidate: the similarity score in [0, 1_000_000]
+/// (higher = better) plus the coarse residual-error grid (length GRID_CELLS,
+/// row-major, cell row 0 = top of the image) used to guide triangle placement.
+#[derive(Clone, Debug)]
+pub struct Eval {
+    pub score: usize,
+    pub error_grid: Vec<u32>,
+}
+
 struct FitnessCalcInner {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -85,11 +113,11 @@ struct FitnessCalcInner {
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     vertex_buffer: wgpu::Buffer,
-    vertex_capacity: u64,
     compute_pipeline: wgpu::ComputePipeline,
-    compute_bind_group: wgpu::BindGroup,
-    fitness_buffer: wgpu::Buffer,
-    fitness_readback: wgpu::Buffer,
+    // One bind group per output slot; binding 3 is offset into result_buffer.
+    slot_bind_groups: Vec<wgpu::BindGroup>,
+    result_buffer: wgpu::Buffer,
+    result_readback: wgpu::Buffer,
 }
 
 #[derive(Clone)]
@@ -176,12 +204,13 @@ impl FitnessCalc {
             cache: None,
         });
 
-        // Genome size is constant per run; MAX_VERTICES gives headroom for any
-        // future growth phase. Filled per call via queue.write_buffer.
-        let vertex_capacity = (MAX_VERTICES as u64) * std::mem::size_of::<Vertex>() as u64;
+        // Vertex buffer holds LAMBDA candidates back-to-back; candidate i lives at
+        // byte offset i * MAX_VERTICES * sizeof(Vertex). sizeof(Vertex) is 28 (4-
+        // aligned), so every per-candidate offset is a legal vertex-buffer offset.
+        let per_candidate_bytes = (MAX_VERTICES as u64) * std::mem::size_of::<Vertex>() as u64;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Vertex Buffer"),
-            size: vertex_capacity,
+            size: per_candidate_bytes * LAMBDA as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -236,57 +265,69 @@ impl FitnessCalc {
             cache: None,
         });
 
+        // scale travels in params so the Rust normaliser and shader agree.
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Fitness Params"),
-            contents: bytemuck::cast_slice(&[texture_size, texture_size, 0u32, 0u32]),
+            contents: bytemuck::cast_slice(&[texture_size, texture_size, FITNESS_SCALE, 0u32]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let fitness_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Fitness Accumulator"),
-            size: std::mem::size_of::<u32>() as u64,
+        // One result buffer holding LAMBDA slots of (score u32 + grid u32[GRID_CELLS]),
+        // each slot padded to SLOT_STRIDE for storage-binding offset alignment.
+        let result_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fitness Results"),
+            size: SLOT_STRIDE * LAMBDA as u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let fitness_readback = device.create_buffer(&wgpu::BufferDescriptor {
+        let result_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Fitness Readback"),
-            size: std::mem::size_of::<u32>() as u64,
+            size: SLOT_STRIDE * LAMBDA as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
+        // One bind group per output slot. Bindings 0–2 (params, goal, rendered
+        // target) are shared; binding 3 is the result buffer offset to slot i.
+        // The shader always writes to "its" SlotResult at element 0 — the binding
+        // offset selects the slot, so no per-dispatch slot index is needed.
         let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Fitness Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &params_buffer,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&goal_texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &fitness_buffer,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-            ],
-        });
+        let slot_size = NonZeroU64::new(SLOT_PAYLOAD).unwrap();
+        let slot_bind_groups: Vec<wgpu::BindGroup> = (0..LAMBDA)
+            .map(|i| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Fitness Bind Group"),
+                    layout: &bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &params_buffer,
+                                offset: 0,
+                                size: None,
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&goal_texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &result_buffer,
+                                offset: i as u64 * SLOT_STRIDE,
+                                size: Some(slot_size),
+                            }),
+                        },
+                    ],
+                })
+            })
+            .collect();
 
         FitnessCalc {
             inner: Arc::new(FitnessCalcInner {
@@ -297,99 +338,145 @@ impl FitnessCalc {
                 texture,
                 texture_view,
                 vertex_buffer,
-                vertex_capacity,
                 compute_pipeline,
-                compute_bind_group,
-                fitness_buffer,
-                fitness_readback,
+                slot_bind_groups,
+                result_buffer,
+                result_readback,
             }),
         }
     }
 }
 
 impl FitnessCalc {
-    /// Render `vertices` into the internal texture, run the compute shader to
-    /// compute the per-pixel diff against the goal, and return a fitness in
-    /// `[0, 1_000_000]` where higher = closer match.
-    fn fitness_of(&self, vertices: &[Vertex]) -> usize {
+    /// Score `batch` candidates in a single GPU submit + readback. For each
+    /// candidate i: render it into the shared target, then run the compute pass
+    /// to write slot i. Within one command buffer, passes execute in order with
+    /// automatic barriers, so reusing one render target across candidates is
+    /// safe. Returns one `Eval` per candidate. `batch.len()` must be ≤ LAMBDA.
+    fn fitness_of_batch(&self, batch: &[&[Vertex]]) -> Vec<Eval> {
         let inner = &*self.inner;
-        let num_vertices = vertices.len() as u32;
-        let vertex_bytes: &[u8] = bytemuck::cast_slice(vertices);
-
         assert!(
-            (vertex_bytes.len() as u64) <= inner.vertex_capacity,
-            "Genome ({} bytes) exceeds preallocated vertex buffer ({} bytes)",
-            vertex_bytes.len(),
-            inner.vertex_capacity
+            batch.len() <= LAMBDA,
+            "batch of {} exceeds LAMBDA {}",
+            batch.len(),
+            LAMBDA
         );
+        let per_candidate_bytes = (MAX_VERTICES as u64) * std::mem::size_of::<Vertex>() as u64;
 
-        inner.queue.write_buffer(&inner.vertex_buffer, 0, vertex_bytes);
-        inner.queue.write_buffer(&inner.fitness_buffer, 0, &0u32.to_le_bytes());
-
-        let mut encoder = inner.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Fitness Encoder"),
-        });
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Fitness Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &inner.texture_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            render_pass.set_pipeline(&inner.render_pipeline);
-            render_pass.set_vertex_buffer(0, inner.vertex_buffer.slice(..));
-            render_pass.draw(0..num_vertices, 0..1);
+        // Upload all candidate vertices; zero the whole result buffer.
+        for (i, verts) in batch.iter().enumerate() {
+            assert!(
+                verts.len() <= MAX_VERTICES,
+                "genome of {} vertices exceeds MAX_VERTICES {}",
+                verts.len(),
+                MAX_VERTICES
+            );
+            let bytes: &[u8] = bytemuck::cast_slice(verts);
+            inner
+                .queue
+                .write_buffer(&inner.vertex_buffer, i as u64 * per_candidate_bytes, bytes);
         }
+        let zeros = vec![0u8; (SLOT_STRIDE * LAMBDA as u64) as usize];
+        inner.queue.write_buffer(&inner.result_buffer, 0, &zeros);
 
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Fitness Compute Pass"),
-                timestamp_writes: None,
+        let mut encoder = inner
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Fitness Encoder"),
             });
-            compute_pass.set_pipeline(&inner.compute_pipeline);
-            compute_pass.set_bind_group(0, &inner.compute_bind_group, &[]);
-            let wg = (inner.texture_size + 7) / 8;
-            compute_pass.dispatch_workgroups(wg, wg, 1);
+
+        for (i, verts) in batch.iter().enumerate() {
+            let num_vertices = verts.len() as u32;
+            let vb_offset = i as u64 * per_candidate_bytes;
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Fitness Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &inner.texture_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                render_pass.set_pipeline(&inner.render_pipeline);
+                render_pass.set_vertex_buffer(0, inner.vertex_buffer.slice(vb_offset..));
+                render_pass.draw(0..num_vertices, 0..1);
+            }
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Fitness Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&inner.compute_pipeline);
+                compute_pass.set_bind_group(0, &inner.slot_bind_groups[i], &[]);
+                let wg = (inner.texture_size + 7) / 8;
+                compute_pass.dispatch_workgroups(wg, wg, 1);
+            }
         }
 
         encoder.copy_buffer_to_buffer(
-            &inner.fitness_buffer,
+            &inner.result_buffer,
             0,
-            &inner.fitness_readback,
+            &inner.result_readback,
             0,
-            std::mem::size_of::<u32>() as u64,
+            SLOT_STRIDE * LAMBDA as u64,
         );
-
         inner.queue.submit(iter::once(encoder.finish()));
 
-        let slice = inner.fitness_readback.slice(..);
+        let slice = inner.result_readback.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             sender.send(result).ok();
         });
         inner.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         receiver.recv().unwrap().unwrap();
-        let raw = {
-            let data = slice.get_mapped_range();
-            u32::from_le_bytes([data[0], data[1], data[2], data[3]])
-        };
-        inner.fitness_readback.unmap();
 
-        // Per-pixel: ΔE76 normalised to [0,1] and scaled to u32 by ×1000 (see fitness.wgsl).
-        let max_total = (inner.texture_size as f64).powi(2) * 1000.0;
-        let similarity = (1.0 - raw as f64 / max_total).max(0.0);
-        (similarity * 1_000_000.0) as usize
+        let max_total = (inner.texture_size as f64).powi(2) * FITNESS_SCALE as f64;
+        let evals = {
+            let data = slice.get_mapped_range();
+            batch
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let base = (i as u64 * SLOT_STRIDE) as usize;
+                    let raw = u32::from_le_bytes([
+                        data[base],
+                        data[base + 1],
+                        data[base + 2],
+                        data[base + 3],
+                    ]);
+                    let similarity = (1.0 - raw as f64 / max_total).max(0.0);
+                    let score = (similarity * 1_000_000.0) as usize;
+                    let grid: Vec<u32> = (0..GRID_CELLS)
+                        .map(|c| {
+                            let o = base + 4 + c * 4;
+                            u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
+                        })
+                        .collect();
+                    Eval {
+                        score,
+                        error_grid: grid,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        inner.result_readback.unmap();
+        evals
+    }
+
+    /// Score a single candidate. Thin wrapper over `fitness_of_batch`. After
+    /// Task 4 `run_es` scores via the batch path directly, so this is exercised
+    /// mainly by tests — `allow(dead_code)` keeps non-test builds warning-free.
+    #[allow(dead_code)]
+    fn fitness_of(&self, vertices: &[Vertex]) -> usize {
+        self.fitness_of_batch(&[vertices])[0].score
     }
 
     /// Render `vertices` and save the result as a PNG. Uses the same render
@@ -786,18 +873,20 @@ pub fn run_es(
         let max_triangles = phase.triangles;
         let min_triangles = (phase.triangles * 3 / 4).max(8);
 
-        // (1+λ): produce λ candidates, keep the best if it beats the parent.
-        let mut best_idx: Option<usize> = None;
-        let mut best_fit = current_fitness;
+        // (1+λ): produce λ candidates and evaluate them all in one GPU submit.
         let mut candidates: Vec<Vec<Vertex>> = Vec::with_capacity(cfg.lambda);
         for _ in 0..cfg.lambda {
-            let c = mutate(&current, sigma, min_triangles, max_triangles, &goal, &mut rng);
-            let f = calc.fitness_of(&c);
-            if f > best_fit {
-                best_fit = f;
-                best_idx = Some(candidates.len());
+            candidates.push(mutate(&current, sigma, min_triangles, max_triangles, &goal, &mut rng));
+        }
+        let cand_refs: Vec<&[Vertex]> = candidates.iter().map(|c| c.as_slice()).collect();
+        let evals = calc.fitness_of_batch(&cand_refs);
+        let mut best_idx: Option<usize> = None;
+        let mut best_fit = current_fitness;
+        for (i, e) in evals.iter().enumerate() {
+            if e.score > best_fit {
+                best_fit = e.score;
+                best_idx = Some(i);
             }
-            candidates.push(c);
         }
 
         let mut accepted = false;
@@ -958,6 +1047,50 @@ mod tests {
         let std = var.sqrt();
         assert!(mean.abs() < 0.05, "mean {mean} not ~0");
         assert!((std - 1.0).abs() < 0.05, "std {std} not ~1");
+    }
+
+    fn make_solid_goal(size: u32, rgb: [u8; 3]) -> GoalImage {
+        let mut buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(size, size);
+        for y in 0..size {
+            for x in 0..size {
+                buf.put_pixel(x, y, Rgba([rgb[0], rgb[1], rgb[2], 255]));
+            }
+        }
+        GoalImage { goal_image: buf }
+    }
+
+    #[test]
+    fn batch_scores_match_single() {
+        let goal = make_checker_goal(32);
+        let (device, queue) = init_test_wgpu();
+        let calc = FitnessCalc::new(device, queue, &goal);
+        let mut rng = StdRng::seed_from_u64(7);
+        let g = init_genome(&goal, 6, &mut rng);
+        let single = calc.fitness_of(&g);
+        let batch = calc.fitness_of_batch(&[g.as_slice(), g.as_slice(), g.as_slice()]);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].score, single);
+        assert_eq!(batch[1].score, single);
+        assert_eq!(batch[2].score, single);
+        assert_eq!(batch[0].error_grid.len(), GRID_CELLS);
+    }
+
+    #[test]
+    fn error_grid_tracks_residual() {
+        // Empty genome renders black. Against a white goal every cell has large
+        // error; against a black goal the error is ~0.
+        let (device, queue) = init_test_wgpu();
+        let white = make_solid_goal(32, [255, 255, 255]);
+        let black = make_solid_goal(32, [0, 0, 0]);
+        let calc_white = FitnessCalc::new(device.clone(), queue.clone(), &white);
+        let calc_black = FitnessCalc::new(device, queue, &black);
+        let empty: Vec<Vertex> = Vec::new();
+        let ew = &calc_white.fitness_of_batch(&[empty.as_slice()])[0];
+        let eb = &calc_black.fitness_of_batch(&[empty.as_slice()])[0];
+        let sum_white: u64 = ew.error_grid.iter().map(|&w| w as u64).sum();
+        let sum_black: u64 = eb.error_grid.iter().map(|&w| w as u64).sum();
+        assert!(ew.error_grid.iter().all(|&w| w > 0), "white goal: every cell should have error");
+        assert!(sum_white > sum_black * 10, "white {sum_white} should dwarf black {sum_black}");
     }
 
     #[test]
