@@ -30,7 +30,7 @@ const PLATEAU_ACCEPTS: u64 = 5;
 const SNAPSHOT_EVERY_IMPROVEMENT: u64 = 100;
 
 // Hard cap on total ES steps (sanity).
-const MAX_STEPS: u64 = 200_000;
+const MAX_STEPS: u64 = 500_000;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable, PartialEq, PartialOrd)]
@@ -466,7 +466,8 @@ impl FitnessCalc {
 
 // ---- (1+λ)-ES support: phases, mutation operators, initial seeding ----
 
-struct Phase {
+#[derive(Clone)]
+pub struct Phase {
     triangles: usize,
     pyramid_level: usize,
     // Initial sigma for this phase. Self-adapted by the 1/5 rule from here.
@@ -479,6 +480,30 @@ const PHASES: &[Phase] = &[
     Phase { triangles: 120, pyramid_level: 2, initial_sigma: 0.10 },  // 512² fine
     Phase { triangles: 150, pyramid_level: 2, initial_sigma: 0.05 },  // 512² finer
 ];
+
+pub struct EsConfig {
+    pub phases: Vec<Phase>,
+    pub max_steps: u64,
+    pub lambda: usize,
+    pub snapshot_every: Option<u64>,
+}
+
+impl EsConfig {
+    fn production() -> Self {
+        Self {
+            phases: PHASES.to_vec(),
+            max_steps: MAX_STEPS,
+            lambda: LAMBDA,
+            snapshot_every: Some(SNAPSHOT_EVERY_IMPROVEMENT),
+        }
+    }
+}
+
+pub struct EsResult {
+    pub initial_fitness: usize,
+    pub final_fitness: usize,
+    pub steps_run: u64,
+}
 
 /// Downsample the goal image to the given square size using a Lanczos filter.
 fn downsample_goal(full: &GoalImage, size: u32) -> GoalImage {
@@ -629,50 +654,62 @@ fn mutate(parent: &[Vertex], sigma: f32, min_triangles: usize, max_triangles: us
     child
 }
 
-fn main() {
-    env_logger::init();
-
-    // ---- GPU setup ----
-    let instance = wgpu::Instance::new(wgpu::Backends::GL);
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))
-    .expect("no suitable wgpu adapter");
-    let (device, queue) = block_on(adapter.request_device(&Default::default(), None))
-        .expect("device init failed");
-    let device = Arc::new(device);
-    let queue = Arc::new(queue);
-
-    // ---- Goal image + pyramid ----
+fn load_goal_image(path: &str) -> GoalImage {
     let goal_image = GoalImage {
-        goal_image: image::open("goal.png")
+        goal_image: image::open(path)
             .expect("goal.png missing in cwd")
             .into_rgba8(),
     };
     println!(
-        "Loaded goal.png ({}x{})",
+        "Loaded {} ({}x{})",
+        path,
         goal_image.goal_image.width(),
         goal_image.goal_image.height()
     );
-    let pyramid = build_pyramid(&device, &queue, &goal_image);
+    goal_image
+}
+
+async fn init_wgpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
+    let instance = wgpu::Instance::new(wgpu::Backends::GL);
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .expect("no suitable wgpu adapter");
+    let (device, queue) = adapter
+        .request_device(&Default::default(), None)
+        .await
+        .expect("device init failed");
+    (Arc::new(device), Arc::new(queue))
+}
+
+fn run_es(
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    goal: GoalImage,
+    cfg: EsConfig,
+) -> EsResult {
+    let pyramid = build_pyramid(&device, &queue, &goal);
     let full_res = pyramid.len() - 1; // index of full-resolution level (for snapshots)
 
     let mut rng = rand::rng();
 
     // ---- Phase 0: initialise the genome at the first phase's triangle count ----
     let mut phase_idx: usize = 0;
-    let mut current = init_genome(&goal_image, PHASES[phase_idx].triangles, &mut rng);
-    let mut sigma = PHASES[phase_idx].initial_sigma;
-    let mut current_fitness = pyramid[PHASES[phase_idx].pyramid_level].fitness_of(&current);
+    let mut current = init_genome(&goal, cfg.phases[phase_idx].triangles, &mut rng);
+    let mut sigma = cfg.phases[phase_idx].initial_sigma;
+    let mut current_fitness = pyramid[cfg.phases[phase_idx].pyramid_level].fitness_of(&current);
+    let initial_fitness = current_fitness;
 
     println!(
         "Phase {} | {} triangles | level {} ({}²) | σ={:.3} | starting fitness {}",
         phase_idx,
-        PHASES[phase_idx].triangles,
-        PHASES[phase_idx].pyramid_level,
-        pyramid[PHASES[phase_idx].pyramid_level].inner.texture_size,
+        cfg.phases[phase_idx].triangles,
+        cfg.phases[phase_idx].pyramid_level,
+        pyramid[cfg.phases[phase_idx].pyramid_level].inner.texture_size,
         sigma,
         current_fitness
     );
@@ -689,11 +726,13 @@ fn main() {
 
     // Trigger a snapshot of the initial state at full resolution so the
     // triangles/ directory has something to compare against.
-    let _ = std::fs::create_dir_all("triangles");
-    pyramid[full_res].snapshot(&current, Path::new("triangles/image0.png"));
+    if let Some(_) = cfg.snapshot_every {
+        let _ = std::fs::create_dir_all("triangles");
+        pyramid[full_res].snapshot(&current, Path::new("triangles/image0.png"));
+    }
 
-    while step < MAX_STEPS {
-        let phase = &PHASES[phase_idx];
+    while step < cfg.max_steps {
+        let phase = &cfg.phases[phase_idx];
         let calc = &pyramid[phase.pyramid_level];
         // Hold the genome near this phase's target. Allow ~25% shrinkage so
         // add/delete can shuffle the composition, but don't let add grow past
@@ -704,9 +743,9 @@ fn main() {
         // (1+λ): produce λ candidates, keep the best if it beats the parent.
         let mut best_idx: Option<usize> = None;
         let mut best_fit = current_fitness;
-        let mut candidates: Vec<Vec<Vertex>> = Vec::with_capacity(LAMBDA);
-        for _ in 0..LAMBDA {
-            let c = mutate(&current, sigma, min_triangles, max_triangles, &goal_image, &mut rng);
+        let mut candidates: Vec<Vec<Vertex>> = Vec::with_capacity(cfg.lambda);
+        for _ in 0..cfg.lambda {
+            let c = mutate(&current, sigma, min_triangles, max_triangles, &goal, &mut rng);
             let f = calc.fitness_of(&c);
             if f > best_fit {
                 best_fit = f;
@@ -741,9 +780,11 @@ fn main() {
         }
 
         // Snapshot occasionally on improvement.
-        if accepted && improvements_total > 0 && improvements_total % SNAPSHOT_EVERY_IMPROVEMENT == 0 {
-            let path_buf = format!("triangles/image{}.png", step);
-            pyramid[full_res].snapshot(&current, Path::new(&path_buf));
+        if let Some(snap_every) = cfg.snapshot_every {
+            if accepted && improvements_total > 0 && improvements_total % snap_every == 0 {
+                let path_buf = format!("triangles/image{}.png", step);
+                pyramid[full_res].snapshot(&current, Path::new(&path_buf));
+            }
         }
 
         // Periodic progress log (rate-limited so output stays readable).
@@ -767,10 +808,10 @@ fn main() {
         if phase_step >= PHASE_MIN_STEPS && phase_step % PLATEAU_WINDOW == 0 {
             let plateaued = accepts_in_plateau_window < PLATEAU_ACCEPTS;
             accepts_in_plateau_window = 0;
-            if plateaued && phase_idx + 1 < PHASES.len() {
+            if plateaued && phase_idx + 1 < cfg.phases.len() {
                 phase_idx += 1;
-                let new_phase = &PHASES[phase_idx];
-                grow_genome(&mut current, new_phase.triangles, &goal_image, &mut rng);
+                let new_phase = &cfg.phases[phase_idx];
+                grow_genome(&mut current, new_phase.triangles, &goal, &mut rng);
                 sigma = new_phase.initial_sigma;
                 // Re-score against the new (possibly higher-resolution) pyramid level.
                 current_fitness = pyramid[new_phase.pyramid_level].fitness_of(&current);
@@ -785,8 +826,10 @@ fn main() {
                     current_fitness
                 );
                 // Snapshot the new phase's starting frame.
-                let path_buf = format!("triangles/image{}_phase{}.png", step, phase_idx);
-                pyramid[full_res].snapshot(&current, Path::new(&path_buf));
+                if let Some(_) = cfg.snapshot_every {
+                    let path_buf = format!("triangles/image{}_phase{}.png", step, phase_idx);
+                    pyramid[full_res].snapshot(&current, Path::new(&path_buf));
+                }
             }
         }
     }
@@ -798,6 +841,26 @@ fn main() {
         improvements_total,
         current_fitness
     );
-    pyramid[full_res].snapshot(&current, Path::new("triangles/final.png"));
+    if let Some(_) = cfg.snapshot_every {
+        pyramid[full_res].snapshot(&current, Path::new("triangles/final.png"));
+    }
+
+    EsResult {
+        initial_fitness,
+        final_fitness: current_fitness,
+        steps_run: step,
+    }
+}
+
+fn main() {
+    env_logger::init();
+    let goal = load_goal_image("goal.png");
+    let (device, queue) = block_on(init_wgpu());
+    let cfg = EsConfig::production();
+    let result = run_es(device, queue, goal, cfg);
+    println!(
+        "Done. Initial fitness: {}, final fitness: {}, steps: {}",
+        result.initial_fitness, result.final_fitness, result.steps_run
+    );
 }
 
