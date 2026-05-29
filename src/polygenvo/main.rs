@@ -916,6 +916,14 @@ mod tests {
             "ES loop must run at least one step"
         );
         // fitness_of returns usize in [0, 1_000_000] where HIGHER = better fit.
+        // A stuck-at-zero result usually means the GPU pipeline returned
+        // garbage (e.g., a bind-group or texture-format mismatch silently
+        // produced an empty render) — that's the most likely silent failure
+        // mode of the wgpu migration, so guard against it explicitly.
+        assert!(
+            result.final_fitness > 0,
+            "fitness stuck at zero — pipeline likely broken"
+        );
         assert!(
             result.final_fitness <= 1_000_000,
             "fitness out of expected range: {}",
