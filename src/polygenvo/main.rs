@@ -1049,7 +1049,7 @@ pub fn run_es(
 
     let mut rng = rand::rng();
 
-    // ---- Phase 0: initialise the genome at the first phase's triangle count ----
+    // ---- Phase 0: initialise the genome (INITIAL_TRIANGLES, capped at phase 0's ceiling) ----
     let mut phase_idx: usize = 0;
     let mut current = init_genome(&goal, INITIAL_TRIANGLES.min(cfg.phases[phase_idx].cap), &mut rng);
     let mut sigma_pos = cfg.phases[phase_idx].initial_sigma_pos;
@@ -1065,7 +1065,7 @@ pub fn run_es(
     let initial_fitness = current_fitness;
 
     println!(
-        "Phase {} | {} triangles | level {} ({}²) | σ_pos={:.3} σ_col={:.3} | starting fitness {}",
+        "Phase {} | cap {} | level {} ({}²) | σ_pos={:.3} σ_col={:.3} | starting fitness {}",
         phase_idx,
         cfg.phases[phase_idx].cap,
         cfg.phases[phase_idx].pyramid_level,
@@ -1232,7 +1232,7 @@ pub fn run_es(
                 col_gen = 0;
                 col_better = 0;
                 println!(
-                    "→ Phase {} | {} triangles | level {} ({}²) | σ_pos={:.3} σ_col={:.3} | re-scored fitness {}",
+                    "→ Phase {} | cap {} | level {} ({}²) | σ_pos={:.3} σ_col={:.3} | re-scored fitness {}",
                     phase_idx,
                     new_phase.cap,
                     new_phase.pyramid_level,
@@ -1417,8 +1417,8 @@ mod tests {
     fn phase_caps_are_monotonic_and_reach_max() {
         let caps: Vec<usize> = PHASES.iter().map(|p| p.cap).collect();
         assert!(
-            caps.windows(2).all(|w| w[1] >= w[0]),
-            "phase caps must be non-decreasing: {caps:?}"
+            caps.windows(2).all(|w| w[1] > w[0]),
+            "phase caps must be strictly increasing: {caps:?}"
         );
         assert_eq!(
             *caps.last().unwrap(),
