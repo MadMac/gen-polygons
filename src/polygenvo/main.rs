@@ -616,6 +616,49 @@ const WARMUP_PHASES: &[Phase] = &[
     Phase { triangles: 150, pyramid_level: 2, initial_sigma_pos: 0.05, initial_sigma_col: 0.04 }, // 512² finer
 ];
 
+/// Build the production phase schedule: the hand-tuned `WARMUP_PHASES`, then
+/// geometric high-count phases growing by `PHASE_GROWTH` from the last warmup
+/// count up to `MAX_TRIANGLES`. The auto phases sit at the finest warmup
+/// pyramid level and reuse its σ (the 1/5-rule re-adapts σ within each phase).
+/// The penultimate value is snapped to the cap when it lands within 15% of it,
+/// so the schedule never ends with a near-duplicate phase.
+fn production_phases() -> Vec<Phase> {
+    let finest = WARMUP_PHASES
+        .last()
+        .expect("WARMUP_PHASES must be non-empty");
+    debug_assert!(
+        MAX_TRIANGLES >= finest.triangles,
+        "MAX_TRIANGLES {} is below the warmup ceiling {}",
+        MAX_TRIANGLES,
+        finest.triangles
+    );
+
+    let mut phases = WARMUP_PHASES.to_vec();
+    let mk = |n: usize| Phase {
+        triangles: n,
+        pyramid_level: finest.pyramid_level,
+        initial_sigma_pos: finest.initial_sigma_pos,
+        initial_sigma_col: finest.initial_sigma_col,
+    };
+
+    // Snap-to-cap threshold: stop generating geometric phases once the next one
+    // would land within 15% of the cap, then append the exact cap instead.
+    let snap = (MAX_TRIANGLES as f32 * 0.85) as usize;
+    let mut n = finest.triangles;
+    loop {
+        n = (n as f32 * PHASE_GROWTH).ceil() as usize;
+        if n >= snap {
+            break;
+        }
+        phases.push(mk(n));
+    }
+    // Append the exact cap, unless the cap equals the warmup ceiling (no tail).
+    if MAX_TRIANGLES > finest.triangles {
+        phases.push(mk(MAX_TRIANGLES));
+    }
+    phases
+}
+
 pub struct EsConfig {
     pub phases: Vec<Phase>,
     pub max_steps: u64,
@@ -626,7 +669,7 @@ pub struct EsConfig {
 impl EsConfig {
     fn production() -> Self {
         Self {
-            phases: WARMUP_PHASES.to_vec(),
+            phases: production_phases(),
             max_steps: MAX_STEPS,
             lambda: LAMBDA,
             snapshot_every: Some(SNAPSHOT_EVERY_IMPROVEMENT),
@@ -1325,6 +1368,36 @@ mod tests {
         let (cx, cy) = cell_to_clip(0, 0.5, 0.5);
         assert!(cx >= -1.0 && cx <= -1.0 + 2.0 / g, "cx {cx} out of cell 0");
         assert!(cy <= 1.0 && cy >= 1.0 - 2.0 / g, "cy {cy} out of cell 0");
+    }
+
+    #[test]
+    fn production_phases_schedule() {
+        let phases = production_phases();
+        let counts: Vec<usize> = phases.iter().map(|p| p.triangles).collect();
+
+        // Starts with the four hand-tuned warmup phases, verbatim.
+        assert_eq!(&counts[..4], &[40, 80, 120, 150]);
+
+        // With the default constants (MAX_TRIANGLES=1000, PHASE_GROWTH=1.6) the
+        // auto tail is geometric ×1.6 with the penultimate value snapped to the cap.
+        assert_eq!(counts, vec![40, 80, 120, 150, 240, 384, 615, 1000]);
+
+        // Strictly increasing: no duplicates, no shrinkage.
+        assert!(
+            counts.windows(2).all(|w| w[1] > w[0]),
+            "schedule not strictly increasing: {counts:?}"
+        );
+
+        // Ends exactly at the cap.
+        assert_eq!(*counts.last().unwrap(), MAX_TRIANGLES);
+
+        // Auto phases inherit the finest warmup phase's pyramid level and σ.
+        let finest = WARMUP_PHASES.last().unwrap();
+        for p in &phases[4..] {
+            assert_eq!(p.pyramid_level, finest.pyramid_level);
+            assert_eq!(p.initial_sigma_pos, finest.initial_sigma_pos);
+            assert_eq!(p.initial_sigma_col, finest.initial_sigma_col);
+        }
     }
 
     #[test]
