@@ -130,6 +130,15 @@ pub struct Eval {
     pub error_grid: Vec<u32>,
 }
 
+/// MSAA sample count for the finest pyramid level. Only the full-resolution
+/// level gets MSAA: there the per-pixel fitness compute dominates, so the extra
+/// render cost is a small fraction of step time. The coarse levels are
+/// render-bound (tiny compute, heavy translucent overdraw), where 4× MSAA
+/// roughly halves throughput — so they stay at 1× for fast exploration.
+/// Geometric edge AA only; alpha-to-coverage stays off because the triangles
+/// already use real OVER alpha blending.
+const MSAA_SAMPLE_COUNT: u32 = 4;
+
 struct FitnessCalcInner {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -137,6 +146,10 @@ struct FitnessCalcInner {
     render_pipeline: wgpu::RenderPipeline,
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
+    // Multisampled render target, present only on MSAA levels. When `Some`, the
+    // render pass draws into it and resolves into `texture`; when `None`, it
+    // renders straight into `texture` (1× — resolve requires a >1× source).
+    msaa_view: Option<wgpu::TextureView>,
     vertex_buffer: wgpu::Buffer,
     compute_pipeline: wgpu::ComputePipeline,
     // One bind group per output slot; binding 3 is offset into result_buffer.
@@ -157,7 +170,12 @@ impl fmt::Debug for FitnessCalc {
 }
 
 impl FitnessCalc {
-    fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, goal_image: &GoalImage) -> Self {
+    fn new(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        goal_image: &GoalImage,
+        sample_count: u32,
+    ) -> Self {
         let texture_size = goal_image.goal_image.width();
         let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
 
@@ -178,6 +196,29 @@ impl FitnessCalc {
             view_formats: &[],
         });
         let texture_view = texture.create_view(&Default::default());
+
+        // Multisampled colour target, only when this level uses MSAA. The
+        // render pass draws into it and resolves into `texture` (single-sample)
+        // at end-of-pass; only RENDER_ATTACHMENT usage is needed since nothing
+        // reads it directly. At 1× there is no MSAA target — the render pass
+        // draws straight into `texture`.
+        let msaa_view = (sample_count > 1).then(|| {
+            let msaa_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Fitness MSAA Render Target"),
+                size: wgpu::Extent3d {
+                    width: texture_size,
+                    height: texture_size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format: target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            msaa_texture.create_view(&Default::default())
+        });
 
         let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Render Shader"),
@@ -221,9 +262,11 @@ impl FitnessCalc {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState {
-                count: 1,
+                count: sample_count,
                 mask: !0,
-                alpha_to_coverage_enabled: true,
+                // Off: triangles use real OVER alpha blending, so a2c would
+                // double-count alpha and dither translucent interiors.
+                alpha_to_coverage_enabled: false,
             },
             multiview_mask: None,
             cache: None,
@@ -362,12 +405,27 @@ impl FitnessCalc {
                 render_pipeline,
                 texture,
                 texture_view,
+                msaa_view,
                 vertex_buffer,
                 compute_pipeline,
                 slot_bind_groups,
                 result_buffer,
                 result_readback,
             }),
+        }
+    }
+}
+
+impl FitnessCalcInner {
+    /// Colour-attachment wiring for a render pass. On MSAA levels, draw into the
+    /// multisampled target and resolve into `texture` (discarding the MS buffer);
+    /// at 1× draw straight into `texture` (resolve needs a >1× source).
+    fn color_attachment(
+        &self,
+    ) -> (&wgpu::TextureView, Option<&wgpu::TextureView>, wgpu::StoreOp) {
+        match &self.msaa_view {
+            Some(ms) => (ms, Some(&self.texture_view), wgpu::StoreOp::Discard),
+            None => (&self.texture_view, None, wgpu::StoreOp::Store),
         }
     }
 }
@@ -414,15 +472,16 @@ impl FitnessCalc {
             let num_vertices = verts.len() as u32;
             let vb_offset = i as u64 * per_candidate_bytes;
             {
+                let (view, resolve_target, store) = inner.color_attachment();
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Fitness Render Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &inner.texture_view,
+                        view,
                         depth_slice: None,
-                        resolve_target: None,
+                        resolve_target,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
+                            store,
                         },
                     })],
                     depth_stencil_attachment: None,
@@ -529,15 +588,16 @@ impl FitnessCalc {
             label: Some("Snapshot Encoder"),
         });
         {
+            let (view, resolve_target, store) = inner.color_attachment();
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Snapshot Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &inner.texture_view,
+                    view,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
+                        store,
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -658,11 +718,15 @@ fn downsample_goal(full: &GoalImage, size: u32) -> GoalImage {
 fn build_pyramid(device: &Arc<wgpu::Device>, queue: &Arc<wgpu::Queue>, goal: &GoalImage) -> Vec<FitnessCalc> {
     let full = goal.goal_image.width();
     let sizes = [full / 4, full / 2, full];
+    let last = sizes.len() - 1;
     sizes
         .iter()
-        .map(|&s| {
+        .enumerate()
+        .map(|(i, &s)| {
             let g = downsample_goal(goal, s);
-            FitnessCalc::new(device.clone(), queue.clone(), &g)
+            // MSAA only on the finest (full-res) level; coarse levels stay 1×.
+            let sample_count = if i == last { MSAA_SAMPLE_COUNT } else { 1 };
+            FitnessCalc::new(device.clone(), queue.clone(), &g, sample_count)
         })
         .collect()
 }
@@ -1352,7 +1416,9 @@ mod tests {
     fn batch_scores_match_single() {
         let goal = make_checker_goal(32);
         let (device, queue) = init_test_wgpu();
-        let calc = FitnessCalc::new(device, queue, &goal);
+        // 4× here so this test also guards the MSAA render+resolve path; the
+        // batch-vs-single equality below holds at any sample count.
+        let calc = FitnessCalc::new(device, queue, &goal, MSAA_SAMPLE_COUNT);
         let mut rng = StdRng::seed_from_u64(7);
         let g = init_genome(&goal, 6, &mut rng);
         let single = calc.fitness_of(&g);
@@ -1371,8 +1437,8 @@ mod tests {
         let (device, queue) = init_test_wgpu();
         let white = make_solid_goal(32, [255, 255, 255]);
         let black = make_solid_goal(32, [0, 0, 0]);
-        let calc_white = FitnessCalc::new(device.clone(), queue.clone(), &white);
-        let calc_black = FitnessCalc::new(device, queue, &black);
+        let calc_white = FitnessCalc::new(device.clone(), queue.clone(), &white, 1);
+        let calc_black = FitnessCalc::new(device, queue, &black, 1);
         let empty: Vec<Vertex> = Vec::new();
         let ew = &calc_white.fitness_of_batch(&[empty.as_slice()])[0];
         let eb = &calc_black.fitness_of_batch(&[empty.as_slice()])[0];
