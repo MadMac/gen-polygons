@@ -12,7 +12,7 @@ use wgpu::util::DeviceExt;
 // Triangle-count ceiling — the one knob that governs capacity. Raising it
 // extends the auto-generated phase tail (see `production_phases`) and the
 // vertex-buffer capacity below; lowering it shortens the tail.
-const MAX_TRIANGLES: usize = 1000;
+const MAX_TRIANGLES: usize = 10000;
 
 // Vertex buffer capacity (in vertices). 3 vertices per triangle.
 const MAX_VERTICES: usize = MAX_TRIANGLES * 3;
@@ -1380,9 +1380,12 @@ mod tests {
         // Starts with the four hand-tuned warmup phases, verbatim.
         assert_eq!(&counts[..WARMUP_PHASES.len()], &[40, 80, 120, 150]);
 
-        // With the default constants (MAX_TRIANGLES=1000, PHASE_GROWTH=1.6) the
+        // With the default constants (MAX_TRIANGLES=10000, PHASE_GROWTH=1.6) the
         // auto tail is geometric ×1.6 with the penultimate value snapped to the cap.
-        assert_eq!(counts, vec![40, 80, 120, 150, 240, 384, 615, 1000]);
+        assert_eq!(
+            counts,
+            vec![40, 80, 120, 150, 240, 384, 615, 984, 1575, 2520, 4032, 6452, 10000]
+        );
 
         // Strictly increasing: no duplicates, no shrinkage.
         assert!(
@@ -1395,7 +1398,7 @@ mod tests {
 
         // Auto phases inherit the finest warmup phase's pyramid level and σ.
         let finest = WARMUP_PHASES.last().unwrap();
-        for p in &phases[4..] {
+        for p in &phases[WARMUP_PHASES.len()..] {
             assert_eq!(p.pyramid_level, finest.pyramid_level);
             assert_eq!(p.initial_sigma_pos, finest.initial_sigma_pos);
             assert_eq!(p.initial_sigma_col, finest.initial_sigma_col);
