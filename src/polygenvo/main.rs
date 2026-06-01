@@ -616,6 +616,14 @@ const WARMUP_PHASES: &[Phase] = &[
     Phase { triangles: 150, pyramid_level: 2, initial_sigma_pos: 0.05, initial_sigma_col: 0.04 }, // 512² finer
 ];
 
+// Compile-time coherence guard: the cap must be at least the warmup ceiling, or
+// the auto-generated tail would be empty/nonsensical. Unlike `debug_assert!`,
+// this also fires in release builds (the binary always runs `--release`).
+const _: () = assert!(
+    MAX_TRIANGLES >= WARMUP_PHASES[WARMUP_PHASES.len() - 1].triangles,
+    "MAX_TRIANGLES is below the WARMUP_PHASES ceiling",
+);
+
 /// Build the production phase schedule: the hand-tuned `WARMUP_PHASES`, then
 /// geometric high-count phases growing by `PHASE_GROWTH` from the last warmup
 /// count up to `MAX_TRIANGLES`. The auto phases sit at the finest warmup
@@ -626,15 +634,9 @@ fn production_phases() -> Vec<Phase> {
     let finest = WARMUP_PHASES
         .last()
         .expect("WARMUP_PHASES must be non-empty");
-    debug_assert!(
-        MAX_TRIANGLES >= finest.triangles,
-        "MAX_TRIANGLES {} is below the warmup ceiling {}",
-        MAX_TRIANGLES,
-        finest.triangles
-    );
 
     let mut phases = WARMUP_PHASES.to_vec();
-    let mk = |n: usize| Phase {
+    let make_phase = |n: usize| Phase {
         triangles: n,
         pyramid_level: finest.pyramid_level,
         initial_sigma_pos: finest.initial_sigma_pos,
@@ -650,11 +652,11 @@ fn production_phases() -> Vec<Phase> {
         if n >= snap {
             break;
         }
-        phases.push(mk(n));
+        phases.push(make_phase(n));
     }
     // Append the exact cap, unless the cap equals the warmup ceiling (no tail).
     if MAX_TRIANGLES > finest.triangles {
-        phases.push(mk(MAX_TRIANGLES));
+        phases.push(make_phase(MAX_TRIANGLES));
     }
     phases
 }
@@ -1376,7 +1378,7 @@ mod tests {
         let counts: Vec<usize> = phases.iter().map(|p| p.triangles).collect();
 
         // Starts with the four hand-tuned warmup phases, verbatim.
-        assert_eq!(&counts[..4], &[40, 80, 120, 150]);
+        assert_eq!(&counts[..WARMUP_PHASES.len()], &[40, 80, 120, 150]);
 
         // With the default constants (MAX_TRIANGLES=1000, PHASE_GROWTH=1.6) the
         // auto tail is geometric ×1.6 with the penultimate value snapped to the cap.
