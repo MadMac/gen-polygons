@@ -821,6 +821,50 @@ fn error_seeded_triangle(
     [mk(base), mk(base + third), mk(base + 2.0 * third)]
 }
 
+/// Subdivide a CCW triangle into 4 midpoint children that exactly tile it.
+/// Children keep the parent's winding and alpha; each child's RGB is sampled
+/// from the goal at the child's own centroid, so a split adds colour resolution
+/// where the goal varies under the triangle (and is ~neutral where it doesn't).
+/// Returns 12 vertices = 4 triangles. Temporary `allow(dead_code)`: wired into
+/// `mutate` in the next task.
+#[allow(dead_code)]
+fn split_triangle(v0: Vertex, v1: Vertex, v2: Vertex, goal: &GoalImage) -> [Vertex; 12] {
+    let alpha = v0.color[3];
+    let mid = |a: &Vertex, b: &Vertex| -> [f32; 3] {
+        [
+            (a.position[0] + b.position[0]) * 0.5,
+            (a.position[1] + b.position[1]) * 0.5,
+            0.0,
+        ]
+    };
+    let m01 = mid(&v0, &v1);
+    let m12 = mid(&v1, &v2);
+    let m20 = mid(&v2, &v0);
+    // Build a child from three positions, recoloured from the goal at its centroid.
+    let child = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3]| -> [Vertex; 3] {
+        let cx = (p0[0] + p1[0] + p2[0]) / 3.0;
+        let cy = (p0[1] + p1[1] + p2[1]) / 3.0;
+        let color = sample_goal_color(goal, cx, cy, alpha);
+        [
+            Vertex { position: p0, color },
+            Vertex { position: p1, color },
+            Vertex { position: p2, color },
+        ]
+    };
+    // Three corner children + one centre child, all CCW (verified against a
+    // CCW parent v0,v1,v2).
+    let c0 = child(v0.position, m01, m20);
+    let c1 = child(v1.position, m12, m01);
+    let c2 = child(v2.position, m20, m12);
+    let c3 = child(m01, m12, m20);
+    let mut out = [Vertex { position: [0.0; 3], color: [0.0; 4] }; 12];
+    out[0..3].copy_from_slice(&c0);
+    out[3..6].copy_from_slice(&c1);
+    out[6..9].copy_from_slice(&c2);
+    out[9..12].copy_from_slice(&c3);
+    out
+}
+
 /// Apply one random mutation to a clone of `parent`, returning the child and the
 /// `OpKind` it exercised (for per-type step-size adaptation). Positional nudges
 /// use `sigma_pos`; recolour/alpha use `sigma_col`; both are Gaussian. Structural
@@ -1402,6 +1446,78 @@ mod tests {
             assert_eq!(p.pyramid_level, finest.pyramid_level);
             assert_eq!(p.initial_sigma_pos, finest.initial_sigma_pos);
             assert_eq!(p.initial_sigma_col, finest.initial_sigma_col);
+        }
+    }
+
+    fn tri_signed_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+        0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]))
+    }
+
+    // Per-column gradient: every distinct x maps to a distinct R channel, so two
+    // points with different x always get different colours.
+    fn make_gradient_goal(size: u32) -> GoalImage {
+        let mut buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(size, size);
+        for y in 0..size {
+            for x in 0..size {
+                let v = (x * 255 / (size - 1)) as u8;
+                buf.put_pixel(x, y, Rgba([v, 128, 255 - v, 255]));
+            }
+        }
+        GoalImage { goal_image: buf }
+    }
+
+    #[test]
+    fn split_triangle_tiles_and_preserves_winding() {
+        let goal = make_solid_goal(64, [100, 150, 200]);
+        let v0 = Vertex { position: [-0.5, -0.5, 0.0], color: [0.1, 0.2, 0.3, 0.5] };
+        let v1 = Vertex { position: [0.5, -0.5, 0.0], color: [0.1, 0.2, 0.3, 0.5] };
+        let v2 = Vertex { position: [0.0, 0.5, 0.0], color: [0.1, 0.2, 0.3, 0.5] };
+        let parent_area = tri_signed_area(v0.position, v1.position, v2.position);
+        assert!(parent_area > 0.0, "test fixture must be CCW");
+
+        let children = split_triangle(v0, v1, v2, &goal);
+        assert_eq!(children.len(), 12, "4 child triangles = 12 vertices");
+
+        let mut total = 0.0;
+        for t in 0..4 {
+            let b = t * 3;
+            let area = tri_signed_area(children[b].position, children[b + 1].position, children[b + 2].position);
+            assert!(area > 0.0, "child {t} must keep CCW winding (got area {area})");
+            total += area;
+        }
+        assert!((total - parent_area).abs() < 1e-5, "children must tile parent: {total} vs {parent_area}");
+    }
+
+    #[test]
+    fn split_triangle_inherits_alpha() {
+        let goal = make_solid_goal(64, [100, 150, 200]);
+        let a = 0.42_f32;
+        let v0 = Vertex { position: [-0.5, -0.5, 0.0], color: [0.1, 0.2, 0.3, a] };
+        let v1 = Vertex { position: [0.5, -0.5, 0.0], color: [0.4, 0.5, 0.6, a] };
+        let v2 = Vertex { position: [0.0, 0.5, 0.0], color: [0.7, 0.8, 0.9, a] };
+        let children = split_triangle(v0, v1, v2, &goal);
+        for (i, v) in children.iter().enumerate() {
+            assert_eq!(v.color[3], a, "child vertex {i} alpha must equal parent alpha");
+        }
+    }
+
+    #[test]
+    fn split_triangle_recolours_from_goal() {
+        // Non-uniform goal: child colours must differ (detail captured).
+        let grad = make_gradient_goal(64);
+        let v0 = Vertex { position: [-0.6, -0.5, 0.0], color: [0.0, 0.0, 0.0, 0.5] };
+        let v1 = Vertex { position: [0.6, -0.5, 0.0], color: [0.0, 0.0, 0.0, 0.5] };
+        let v2 = Vertex { position: [0.0, 0.6, 0.0], color: [0.0, 0.0, 0.0, 0.5] };
+        let kids = split_triangle(v0, v1, v2, &grad);
+        let reds: Vec<f32> = (0..4).map(|t| kids[t * 3].color[0]).collect();
+        assert!(reds.iter().any(|&r| (r - reds[0]).abs() > 1e-3), "non-uniform goal: child colours must differ, got {reds:?}");
+
+        // Uniform goal: all children share one colour (the neutral case).
+        let solid = make_solid_goal(64, [10, 20, 30]);
+        let kids2 = split_triangle(v0, v1, v2, &solid);
+        for t in 0..4 {
+            let c = kids2[t * 3].color;
+            assert!((c[0] - kids2[0].color[0]).abs() < 1e-6, "uniform goal: child {t} colour must match");
         }
     }
 
