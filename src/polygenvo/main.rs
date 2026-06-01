@@ -9,16 +9,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 
-// Triangle-count ceiling — the one knob that governs capacity. Raising it
-// extends the auto-generated phase tail (see `production_phases`) and the
-// vertex-buffer capacity below; lowering it shortens the tail.
+// Triangle-count ceiling — the one knob that governs capacity. It is the final
+// phase's cap (see PHASES) and the vertex-buffer capacity below. The genome
+// grows toward it organically via the fitness-gated `split` operator.
 const MAX_TRIANGLES: usize = 10000;
 
 // Vertex buffer capacity (in vertices). 3 vertices per triangle.
 const MAX_VERTICES: usize = MAX_TRIANGLES * 3;
-
-// Geometric growth multiplier for the auto-generated high-count phases.
-const PHASE_GROWTH: f32 = 1.6;
 
 // Cold-start triangle count (also the reference count for add's seed-radius
 // scaling: a fresh triangle shrinks toward the current triangle scale as the
@@ -604,67 +601,24 @@ impl FitnessCalc {
 
 #[derive(Clone)]
 pub struct Phase {
-    triangles: usize,
+    // Maximum triangles the genome may grow to in this phase (a ceiling, not a
+    // fill target — growth is organic via `split`).
+    cap: usize,
     pyramid_level: usize,
     // Initial step sizes for this phase, self-adapted by per-type 1/5 rules.
     initial_sigma_pos: f32,
     initial_sigma_col: f32,
 }
 
-// Hand-tuned coarse-to-fine warmup phases (the pyramid climb). The production
-// schedule keeps these verbatim, then `production_phases` appends geometric
-// high-count phases above the last warmup count up to MAX_TRIANGLES.
-const WARMUP_PHASES: &[Phase] = &[
-    Phase { triangles: 40,  pyramid_level: 0, initial_sigma_pos: 0.30, initial_sigma_col: 0.20 }, // 128² coarse
-    Phase { triangles: 80,  pyramid_level: 1, initial_sigma_pos: 0.18, initial_sigma_col: 0.12 }, // 256² medium
-    Phase { triangles: 120, pyramid_level: 2, initial_sigma_pos: 0.10, initial_sigma_col: 0.08 }, // 512² fine
-    Phase { triangles: 150, pyramid_level: 2, initial_sigma_pos: 0.05, initial_sigma_col: 0.04 }, // 512² finer
+// Coarse-to-fine schedule: pyramid level + initial σ per phase, with a capacity
+// cap that rises to MAX_TRIANGLES at the finest level. Promotion advances this
+// schedule on plateau; the genome grows toward each cap via `split`.
+const PHASES: &[Phase] = &[
+    Phase { cap: 300,           pyramid_level: 0, initial_sigma_pos: 0.30, initial_sigma_col: 0.20 }, // 128² coarse
+    Phase { cap: 800,           pyramid_level: 1, initial_sigma_pos: 0.18, initial_sigma_col: 0.12 }, // 256² medium
+    Phase { cap: 2000,          pyramid_level: 2, initial_sigma_pos: 0.10, initial_sigma_col: 0.08 }, // 512² fine
+    Phase { cap: MAX_TRIANGLES, pyramid_level: 2, initial_sigma_pos: 0.05, initial_sigma_col: 0.04 }, // 512² finest
 ];
-
-// Compile-time coherence guard: the cap must be at least the warmup ceiling, or
-// the auto-generated tail would be empty/nonsensical. Unlike `debug_assert!`,
-// this also fires in release builds (the binary always runs `--release`).
-const _: () = assert!(
-    MAX_TRIANGLES >= WARMUP_PHASES[WARMUP_PHASES.len() - 1].triangles,
-    "MAX_TRIANGLES is below the WARMUP_PHASES ceiling",
-);
-
-/// Build the production phase schedule: the hand-tuned `WARMUP_PHASES`, then
-/// geometric high-count phases growing by `PHASE_GROWTH` from the last warmup
-/// count up to `MAX_TRIANGLES`. The auto phases sit at the finest warmup
-/// pyramid level and reuse its σ (the 1/5-rule re-adapts σ within each phase).
-/// The penultimate value is snapped to the cap when it lands within 15% of it,
-/// so the schedule never ends with a near-duplicate phase.
-fn production_phases() -> Vec<Phase> {
-    let finest = WARMUP_PHASES
-        .last()
-        .expect("WARMUP_PHASES must be non-empty");
-
-    let mut phases = WARMUP_PHASES.to_vec();
-    let make_phase = |n: usize| Phase {
-        triangles: n,
-        pyramid_level: finest.pyramid_level,
-        initial_sigma_pos: finest.initial_sigma_pos,
-        initial_sigma_col: finest.initial_sigma_col,
-    };
-
-    // Snap-to-cap threshold: stop generating geometric phases once the next one
-    // would land within 15% of the cap, then append the exact cap instead.
-    let snap = (MAX_TRIANGLES as f32 * 0.85) as usize;
-    let mut n = finest.triangles;
-    loop {
-        n = (n as f32 * PHASE_GROWTH).ceil() as usize;
-        if n >= snap {
-            break;
-        }
-        phases.push(make_phase(n));
-    }
-    // Append the exact cap, unless the cap equals the warmup ceiling (no tail).
-    if MAX_TRIANGLES > finest.triangles {
-        phases.push(make_phase(MAX_TRIANGLES));
-    }
-    phases
-}
 
 pub struct EsConfig {
     pub phases: Vec<Phase>,
@@ -676,7 +630,7 @@ pub struct EsConfig {
 impl EsConfig {
     fn production() -> Self {
         Self {
-            phases: production_phases(),
+            phases: PHASES.to_vec(),
             max_steps: MAX_STEPS,
             lambda: LAMBDA,
             snapshot_every: Some(SNAPSHOT_EVERY_IMPROVEMENT),
@@ -753,14 +707,6 @@ fn init_genome(goal: &GoalImage, n_triangles: usize, rng: &mut impl Rng) -> Vec<
     genome
 }
 
-/// Grow `genome` until it has exactly `target_triangles * 3` vertices by
-/// appending new colour-seeded triangles. No-op if already at or above target.
-fn grow_genome(genome: &mut Vec<Vertex>, target_triangles: usize, goal: &GoalImage, rng: &mut impl Rng) {
-    while genome.len() / 3 < target_triangles {
-        let tri = random_color_seeded_triangle(goal, rng, 0.2);
-        genome.extend_from_slice(&tri);
-    }
-}
 
 /// One sample from N(0, sigma) via the Box-Muller transform. `rand 0.10` ships no
 /// normal distribution and we avoid adding `rand_distr`, so we derive it from two
@@ -1105,7 +1051,7 @@ pub fn run_es(
 
     // ---- Phase 0: initialise the genome at the first phase's triangle count ----
     let mut phase_idx: usize = 0;
-    let mut current = init_genome(&goal, cfg.phases[phase_idx].triangles, &mut rng);
+    let mut current = init_genome(&goal, INITIAL_TRIANGLES.min(cfg.phases[phase_idx].cap), &mut rng);
     let mut sigma_pos = cfg.phases[phase_idx].initial_sigma_pos;
     let mut sigma_col = cfg.phases[phase_idx].initial_sigma_col;
     let mut current_fitness;
@@ -1121,7 +1067,7 @@ pub fn run_es(
     println!(
         "Phase {} | {} triangles | level {} ({}²) | σ_pos={:.3} σ_col={:.3} | starting fitness {}",
         phase_idx,
-        cfg.phases[phase_idx].triangles,
+        cfg.phases[phase_idx].cap,
         cfg.phases[phase_idx].pyramid_level,
         pyramid[cfg.phases[phase_idx].pyramid_level].inner.texture_size,
         sigma_pos,
@@ -1154,11 +1100,11 @@ pub fn run_es(
     while step < cfg.max_steps {
         let phase = &cfg.phases[phase_idx];
         let calc = &pyramid[phase.pyramid_level];
-        // Hold the genome near this phase's target. Allow ~25% shrinkage so
-        // add/delete can shuffle the composition, but don't let add grow past
-        // the phase's target — that's what phase promotion is for.
-        let max_triangles = phase.triangles;
-        let min_triangles = (phase.triangles * 3 / 4).max(8);
+        // `split`/`add` may grow the genome up to this phase's cap; `delete`
+        // may prune down to a small absolute floor. Growth is organic and
+        // selection-gated, so there is no fill target to hold near.
+        let max_triangles = phase.cap;
+        let min_triangles = 8;
 
         // (1+λ): produce λ candidates and evaluate them all in one GPU submit.
         let mut candidates: Vec<Vec<Vertex>> = Vec::with_capacity(cfg.lambda);
@@ -1266,7 +1212,8 @@ pub fn run_es(
             if plateaued && phase_idx + 1 < cfg.phases.len() {
                 phase_idx += 1;
                 let new_phase = &cfg.phases[phase_idx];
-                grow_genome(&mut current, new_phase.triangles, &goal, &mut rng);
+                // No genome growth on promotion: it only raises the cap and
+                // sharpens evaluation. The genome grows organically via `split`.
                 sigma_pos = new_phase.initial_sigma_pos;
                 sigma_col = new_phase.initial_sigma_col;
                 // Re-score against the new (possibly higher-resolution) pyramid level.
@@ -1287,7 +1234,7 @@ pub fn run_es(
                 println!(
                     "→ Phase {} | {} triangles | level {} ({}²) | σ_pos={:.3} σ_col={:.3} | re-scored fitness {}",
                     phase_idx,
-                    new_phase.triangles,
+                    new_phase.cap,
                     new_phase.pyramid_level,
                     pyramid[new_phase.pyramid_level].inner.texture_size,
                     sigma_pos,
@@ -1467,36 +1414,17 @@ mod tests {
     }
 
     #[test]
-    fn production_phases_schedule() {
-        let phases = production_phases();
-        let counts: Vec<usize> = phases.iter().map(|p| p.triangles).collect();
-
-        // Starts with the four hand-tuned warmup phases, verbatim.
-        assert_eq!(&counts[..WARMUP_PHASES.len()], &[40, 80, 120, 150]);
-
-        // With the default constants (MAX_TRIANGLES=10000, PHASE_GROWTH=1.6) the
-        // auto tail is geometric ×1.6 with the penultimate value snapped to the cap.
-        assert_eq!(
-            counts,
-            vec![40, 80, 120, 150, 240, 384, 615, 984, 1575, 2520, 4032, 6452, 10000]
-        );
-
-        // Strictly increasing: no duplicates, no shrinkage.
+    fn phase_caps_are_monotonic_and_reach_max() {
+        let caps: Vec<usize> = PHASES.iter().map(|p| p.cap).collect();
         assert!(
-            counts.windows(2).all(|w| w[1] > w[0]),
-            "schedule not strictly increasing: {counts:?}"
+            caps.windows(2).all(|w| w[1] >= w[0]),
+            "phase caps must be non-decreasing: {caps:?}"
         );
-
-        // Ends exactly at the cap.
-        assert_eq!(*counts.last().unwrap(), MAX_TRIANGLES);
-
-        // Auto phases inherit the finest warmup phase's pyramid level and σ.
-        let finest = WARMUP_PHASES.last().unwrap();
-        for p in &phases[WARMUP_PHASES.len()..] {
-            assert_eq!(p.pyramid_level, finest.pyramid_level);
-            assert_eq!(p.initial_sigma_pos, finest.initial_sigma_pos);
-            assert_eq!(p.initial_sigma_col, finest.initial_sigma_col);
-        }
+        assert_eq!(
+            *caps.last().unwrap(),
+            MAX_TRIANGLES,
+            "final phase cap must be the global triangle ceiling"
+        );
     }
 
     fn tri_signed_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
@@ -1596,7 +1524,7 @@ mod tests {
         // level (build_pyramid sizes = [full/4, full/2, full]); for a 32×32
         // goal this evaluates at 8×8 — fast and plenty for a smoke test.
         let test_phases = vec![Phase {
-            triangles: 6,
+            cap: 6,
             pyramid_level: 0,
             initial_sigma_pos: 0.1,
             initial_sigma_col: 0.1,
