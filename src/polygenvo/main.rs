@@ -20,6 +20,11 @@ const MAX_VERTICES: usize = MAX_TRIANGLES * 3;
 // Geometric growth multiplier for the auto-generated high-count phases.
 const PHASE_GROWTH: f32 = 1.6;
 
+// Cold-start triangle count (also the reference count for add's seed-radius
+// scaling: a fresh triangle shrinks toward the current triangle scale as the
+// genome grows).
+const INITIAL_TRIANGLES: usize = 40;
+
 // (1+λ)-ES: number of mutated candidates evaluated per step.
 const LAMBDA: usize = 6;
 
@@ -825,9 +830,7 @@ fn error_seeded_triangle(
 /// Children keep the parent's winding and alpha; each child's RGB is sampled
 /// from the goal at the child's own centroid, so a split adds colour resolution
 /// where the goal varies under the triangle (and is ~neutral where it doesn't).
-/// Returns 12 vertices = 4 triangles. Temporary `allow(dead_code)`: wired into
-/// `mutate` in the next task.
-#[allow(dead_code)]
+/// Returns 12 vertices = 4 triangles.
 fn split_triangle(v0: Vertex, v1: Vertex, v2: Vertex, goal: &GoalImage) -> [Vertex; 12] {
     let alpha = v0.color[3];
     let mid = |a: &Vertex, b: &Vertex| -> [f32; 3] {
@@ -865,6 +868,45 @@ fn split_triangle(v0: Vertex, v1: Vertex, v2: Vertex, goal: &GoalImage) -> [Vert
     out
 }
 
+/// Replace one triangle (chosen near a high-error cell) with its 4 midpoint
+/// children, growing the genome by 3 triangles. No-op if the genome is empty or
+/// a split would exceed `max_triangles` (a split adds 3). This is the only
+/// growth path: it is applied as a mutation candidate, so `(1+λ)` selection
+/// keeps it only when the added detail improves fitness.
+fn grow_by_split(
+    genome: &mut Vec<Vertex>,
+    goal: &GoalImage,
+    error_grid: &[u32],
+    max_triangles: usize,
+    rng: &mut impl Rng,
+) {
+    let n = genome.len() / 3;
+    if n == 0 || n + 3 > max_triangles {
+        return;
+    }
+    // Bias toward error: pick the triangle whose centroid is nearest a
+    // roulette-selected high-error cell centre.
+    let cell = sample_error_cell(error_grid, rng);
+    let (tx, ty) = cell_to_clip(cell, 0.5, 0.5);
+    let mut best_t = 0usize;
+    let mut best_d = f32::INFINITY;
+    for t in 0..n {
+        let b = t * 3;
+        let cx = (genome[b].position[0] + genome[b + 1].position[0] + genome[b + 2].position[0]) / 3.0;
+        let cy = (genome[b].position[1] + genome[b + 1].position[1] + genome[b + 2].position[1]) / 3.0;
+        let d = (cx - tx) * (cx - tx) + (cy - ty) * (cy - ty);
+        if d < best_d {
+            best_d = d;
+            best_t = t;
+        }
+    }
+    let b = best_t * 3;
+    // Read the parent (Copy) before splicing, then replace it in place so the 4
+    // children inherit its z/draw position (alpha-blend order preserved).
+    let children = split_triangle(genome[b], genome[b + 1], genome[b + 2], goal);
+    genome.splice(b..b + 3, children);
+}
+
 /// Apply one random mutation to a clone of `parent`, returning the child and the
 /// `OpKind` it exercised (for per-type step-size adaptation). Positional nudges
 /// use `sigma_pos`; recolour/alpha use `sigma_col`; both are Gaussian. Structural
@@ -888,7 +930,7 @@ fn mutate(
 
     let op = rng.random_range(0u32..100);
     let kind = match op {
-        0..=39 => {
+        0..=37 => {
             // Nudge a single vertex of one triangle (Gaussian, sigma_pos).
             let t = rng.random_range(0..n);
             let v = rng.random_range(0..3);
@@ -897,7 +939,7 @@ fn mutate(
             child[idx].position[1] = (child[idx].position[1] + gaussian(rng, sigma_pos)).clamp(-1.0, 1.0);
             OpKind::Positional
         }
-        40..=64 => {
+        38..=61 => {
             // Recolour all three vertices of one triangle (RGB, Gaussian, sigma_col).
             let t = rng.random_range(0..n);
             let dr = gaussian(rng, sigma_col);
@@ -911,7 +953,7 @@ fn mutate(
             }
             OpKind::Chromatic
         }
-        65..=77 => {
+        62..=73 => {
             // Nudge the alpha of one triangle (Gaussian, sigma_col).
             let t = rng.random_range(0..n);
             let da = gaussian(rng, sigma_col);
@@ -921,7 +963,13 @@ fn mutate(
             }
             OpKind::Chromatic
         }
-        78..=85 => {
+        74..=83 => {
+            // Split a high-error triangle into 4 midpoint children — the only
+            // growth path, gated by selection (see `grow_by_split`).
+            grow_by_split(&mut child, goal, error_grid, max_triangles, rng);
+            OpKind::Structural
+        }
+        84..=88 => {
             // Swap z-order with a neighbouring triangle.
             if n > 1 {
                 let t = rng.random_range(0..n - 1);
@@ -931,10 +979,12 @@ fn mutate(
             }
             OpKind::Structural
         }
-        86..=91 => {
+        89..=93 => {
             // Add a new triangle seeded in a high-error region.
             if n < max_triangles {
-                let tri = error_seeded_triangle(goal, error_grid, rng, 0.2);
+                let seed_radius =
+                    (0.2 * (INITIAL_TRIANGLES as f32 / n as f32).sqrt()).clamp(0.02, 0.2);
+                let tri = error_seeded_triangle(goal, error_grid, rng, seed_radius);
                 let insert_at = rng.random_range(0..=n) * 3;
                 for (offset, vert) in tri.iter().enumerate() {
                     child.insert(insert_at + offset, *vert);
@@ -942,7 +992,7 @@ fn mutate(
             }
             OpKind::Structural
         }
-        92..=95 => {
+        94..=96 => {
             // Relocate an existing triangle's centroid to a high-error cell and
             // recolour it to that region — recycles triangles that aren't helping.
             let t = rng.random_range(0..n);
@@ -984,7 +1034,7 @@ fn mutate(
             OpKind::Structural
         }
         _ => {
-            // Delete one triangle (op in 96..=99).
+            // Delete one triangle (op in 97..=99).
             if n > min_triangles {
                 let t = rng.random_range(0..n);
                 for _ in 0..3 {
@@ -1519,6 +1569,23 @@ mod tests {
             let c = kids2[t * 3].color;
             assert!((c[0] - kids2[0].color[0]).abs() < 1e-6, "uniform goal: child {t} colour must match");
         }
+    }
+
+    #[test]
+    fn grow_by_split_respects_cap() {
+        let goal = make_solid_goal(64, [100, 150, 200]);
+        let mut rng = StdRng::seed_from_u64(99);
+        let grid = vec![1u32; GRID_CELLS]; // flat error -> any triangle eligible
+        let mut genome = init_genome(&goal, 5, &mut rng); // 5 triangles = 15 verts
+
+        // Below cap: one split replaces 1 triangle with 4 -> net +3 triangles.
+        grow_by_split(&mut genome, &goal, &grid, 100, &mut rng);
+        assert_eq!(genome.len() / 3, 8, "split should grow 5 -> 8 triangles");
+
+        // At/over cap: n + 3 > cap -> no-op.
+        let before = genome.clone();
+        grow_by_split(&mut genome, &goal, &grid, 9, &mut rng); // 8 + 3 = 11 > 9
+        assert_eq!(genome, before, "split must be a no-op when it would exceed the cap");
     }
 
     #[test]
