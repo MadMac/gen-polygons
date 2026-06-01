@@ -9,8 +9,16 @@ use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 
-// Vertex buffer capacity (in vertices). 450 vertices = 150 triangles.
-const MAX_VERTICES: usize = 450;
+// Triangle-count ceiling — the one knob that governs capacity. Raising it
+// extends the auto-generated phase tail (see `production_phases`) and the
+// vertex-buffer capacity below; lowering it shortens the tail.
+const MAX_TRIANGLES: usize = 1000;
+
+// Vertex buffer capacity (in vertices). 3 vertices per triangle.
+const MAX_VERTICES: usize = MAX_TRIANGLES * 3;
+
+// Geometric growth multiplier for the auto-generated high-count phases.
+const PHASE_GROWTH: f32 = 1.6;
 
 // (1+λ)-ES: number of mutated candidates evaluated per step.
 const LAMBDA: usize = 6;
@@ -598,7 +606,10 @@ pub struct Phase {
     initial_sigma_col: f32,
 }
 
-const PHASES: &[Phase] = &[
+// Hand-tuned coarse-to-fine warmup phases (the pyramid climb). The production
+// schedule keeps these verbatim, then `production_phases` appends geometric
+// high-count phases above the last warmup count up to MAX_TRIANGLES.
+const WARMUP_PHASES: &[Phase] = &[
     Phase { triangles: 40,  pyramid_level: 0, initial_sigma_pos: 0.30, initial_sigma_col: 0.20 }, // 128² coarse
     Phase { triangles: 80,  pyramid_level: 1, initial_sigma_pos: 0.18, initial_sigma_col: 0.12 }, // 256² medium
     Phase { triangles: 120, pyramid_level: 2, initial_sigma_pos: 0.10, initial_sigma_col: 0.08 }, // 512² fine
@@ -615,7 +626,7 @@ pub struct EsConfig {
 impl EsConfig {
     fn production() -> Self {
         Self {
-            phases: PHASES.to_vec(),
+            phases: WARMUP_PHASES.to_vec(),
             max_steps: MAX_STEPS,
             lambda: LAMBDA,
             snapshot_every: Some(SNAPSHOT_EVERY_IMPROVEMENT),
