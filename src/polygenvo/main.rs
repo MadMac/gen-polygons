@@ -53,7 +53,7 @@ fn main() {
     // `window::init_window` brings up both the window and the device together;
     // the headless path keeps using `gpu::init_wgpu`. Either way the ES and the
     // viewer share one device/queue.
-    let mut window_init = show_window.then(window::init_window);
+    let mut window_init = show_window.then(|| window::init_window(goal.pixels.width()));
     let (device, queue) = match &window_init {
         Some(w) => (w.device.clone(), w.queue.clone()),
         None => block_on(gpu::init_wgpu()),

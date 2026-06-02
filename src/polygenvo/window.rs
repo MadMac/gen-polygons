@@ -24,10 +24,15 @@ use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use winit::window::{Window, WindowId};
 
 use crate::es::StepObserver;
+use crate::fitness::MSAA_SAMPLE_COUNT;
 use crate::genome::{Vertex, MAX_VERTICES};
 
-// Initial window size in logical pixels (square, like the goal image).
-const INITIAL_WINDOW_SIZE: u32 = 768;
+// The initial window is sized from the goal image (the render is square and
+// resolution-independent), clamped to this range so a tiny goal still opens a
+// usable window and a huge one doesn't open off-screen. It stays freely
+// resizable afterwards.
+const MIN_WINDOW_SIZE: u32 = 256;
+const MAX_WINDOW_SIZE: u32 = 1024;
 
 // Cap on-screen refresh to ~display rate. The ES improves far faster than the
 // eye (or monitor) can follow, so without this a burst of improvements would
@@ -50,6 +55,8 @@ pub(crate) struct WindowInit {
 #[derive(Default)]
 struct WindowApp {
     window: Option<Arc<Window>>,
+    // Initial window edge length in logical pixels (square), derived from the goal.
+    initial_size: u32,
     close_requested: bool,
     resized: Option<(u32, u32)>,
     redraw_requested: bool,
@@ -60,7 +67,7 @@ impl ApplicationHandler for WindowApp {
         if self.window.is_none() {
             let attrs = Window::default_attributes()
                 .with_title("polygenvo — best candidate")
-                .with_inner_size(LogicalSize::new(INITIAL_WINDOW_SIZE, INITIAL_WINDOW_SIZE));
+                .with_inner_size(LogicalSize::new(self.initial_size, self.initial_size));
             let window = event_loop
                 .create_window(attrs)
                 .expect("failed to create window");
@@ -79,10 +86,10 @@ impl ApplicationHandler for WindowApp {
 }
 
 /// Owns the surface + a render pipeline targeting the surface's (sRGB) format,
-/// and draws the genome straight to the swapchain. This mirrors the render half
-/// of `FitnessCalc::snapshot` (same passthrough `shader.wgsl`, CCW + back-cull,
-/// BLACK clear) but presents to a window instead of reading back to a PNG, and
-/// runs no compute pass.
+/// and draws the genome to the swapchain. This mirrors the render half of
+/// `FitnessCalc::snapshot` (same passthrough `shader.wgsl`, CCW + back-cull,
+/// BLACK clear, `MSAA_SAMPLE_COUNT`× MSAA resolved into the frame) but presents
+/// to a window instead of reading back to a PNG, and runs no compute pass.
 struct Presenter {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -90,6 +97,10 @@ struct Presenter {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
+    // Multisampled colour target resolved into each frame; `None` at 1× (when
+    // the surface format doesn't support MSAA). Recreated on resize.
+    sample_count: u32,
+    msaa_view: Option<wgpu::TextureView>,
     last_present: Option<Instant>,
 }
 
@@ -99,6 +110,7 @@ impl Presenter {
         queue: Arc<wgpu::Queue>,
         surface: wgpu::Surface<'static>,
         config: wgpu::SurfaceConfiguration,
+        sample_count: u32,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Window Render Shader"),
@@ -142,7 +154,7 @@ impl Presenter {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState {
-                count: 1,
+                count: sample_count,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -157,6 +169,8 @@ impl Presenter {
         });
 
         surface.configure(&device, &config);
+        let msaa_view =
+            (sample_count > 1).then(|| make_msaa_view(&device, &config, sample_count));
         Self {
             device,
             queue,
@@ -164,6 +178,8 @@ impl Presenter {
             config,
             pipeline,
             vertex_buffer,
+            sample_count,
+            msaa_view,
             last_present: None,
         }
     }
@@ -184,6 +200,9 @@ impl Presenter {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        if self.sample_count > 1 {
+            self.msaa_view = Some(make_msaa_view(&self.device, &self.config, self.sample_count));
+        }
     }
 
     /// Render `genome` to the next surface frame and present it.
@@ -209,7 +228,13 @@ impl Presenter {
             _ => return,
         };
 
-        let view = frame.texture.create_view(&Default::default());
+        let frame_view = frame.texture.create_view(&Default::default());
+        // With MSAA, draw into the multisampled target and resolve into the
+        // frame; at 1× draw straight into the frame.
+        let (view, resolve_target) = match &self.msaa_view {
+            Some(msaa) => (msaa, Some(&frame_view)),
+            None => (&frame_view, None),
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -219,9 +244,9 @@ impl Presenter {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Window Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -240,6 +265,30 @@ impl Presenter {
         frame.present();
         self.last_present = Some(Instant::now());
     }
+}
+
+/// Build a multisampled colour target matching the surface size/format, for
+/// MSAA passes that resolve into the swapchain frame.
+fn make_msaa_view(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    sample_count: u32,
+) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Window MSAA Target"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&Default::default())
 }
 
 /// The live observer handed to `run_es`. Each step it pumps window events and,
@@ -275,7 +324,7 @@ impl StepObserver for WindowObserver {
 /// Open the live window and bring up a surface-compatible wgpu device. Returns
 /// the shared device/queue plus the observer that `run_es` drives. Panics on any
 /// setup failure (the feature is opt-in via `--show-window`).
-pub(crate) fn init_window() -> WindowInit {
+pub(crate) fn init_window(goal_size: u32) -> WindowInit {
     let mut event_loop = EventLoop::new().expect("failed to create event loop");
 
     // GL backend (matching the headless path). On GLES/Wayland the instance
@@ -288,8 +337,11 @@ pub(crate) fn init_window() -> WindowInit {
         display: Some(Box::new(event_loop.owned_display_handle())),
     });
 
-    // Pump once so `resumed` runs and creates the window.
-    let mut app = WindowApp::default();
+    // Pump once so `resumed` runs and creates the window, sized from the goal.
+    let mut app = WindowApp {
+        initial_size: goal_size.clamp(MIN_WINDOW_SIZE, MAX_WINDOW_SIZE),
+        ..Default::default()
+    };
     let _ = event_loop.pump_app_events(Some(Duration::ZERO), &mut app);
     let window = app
         .window
@@ -349,7 +401,19 @@ pub(crate) fn init_window() -> WindowInit {
         }
     }
 
-    let presenter = Presenter::new(device.clone(), queue.clone(), surface, config);
+    // Use MSAA to match the anti-aliased PNG snapshots, but only if the chosen
+    // surface format actually supports it (else fall back to single-sample).
+    let sample_count = if adapter
+        .get_texture_format_features(config.format)
+        .flags
+        .sample_count_supported(MSAA_SAMPLE_COUNT)
+    {
+        MSAA_SAMPLE_COUNT
+    } else {
+        1
+    };
+
+    let presenter = Presenter::new(device.clone(), queue.clone(), surface, config, sample_count);
 
     WindowInit {
         device,
