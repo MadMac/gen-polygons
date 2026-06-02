@@ -37,13 +37,39 @@ pub(crate) fn downsample_goal(full: &GoalImage, size: u32) -> GoalImage {
     GoalImage { pixels: resized }
 }
 
-/// Sample the goal image at a clip-space point to seed a triangle's colour.
-/// Clip space `(-1, -1)` maps to top-left of the image (image y is flipped).
+/// Sample the goal image at a clip-space point to seed a triangle's colour,
+/// using bilinear interpolation between the four surrounding texels so seeded
+/// and split triangles pick up the goal's local colour ramp rather than
+/// snapping to one pixel. Clip space `(-1, -1)` maps to top-left of the image
+/// (image y is flipped).
 pub(crate) fn sample_goal_color(goal: &GoalImage, cx: f32, cy: f32, alpha: f32) -> [f32; 4] {
     let w = goal.pixels.width();
     let h = goal.pixels.height();
-    let px = (((cx.clamp(-1.0, 1.0) + 1.0) * 0.5) * (w - 1) as f32) as u32;
-    let py = (((1.0 - cy.clamp(-1.0, 1.0)) * 0.5) * (h - 1) as f32) as u32;
-    let p = goal.pixels.get_pixel(px.min(w - 1), py.min(h - 1));
-    [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0, alpha]
+    // Fractional pixel coordinates in [0, w-1] / [0, h-1].
+    let fx = ((cx.clamp(-1.0, 1.0) + 1.0) * 0.5) * (w - 1) as f32;
+    let fy = ((1.0 - cy.clamp(-1.0, 1.0)) * 0.5) * (h - 1) as f32;
+    let x0 = fx.floor() as u32;
+    let y0 = fy.floor() as u32;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+
+    let texel = |x: u32, y: u32| {
+        let p = goal.pixels.get_pixel(x, y);
+        [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]
+    };
+    let c00 = texel(x0, y0);
+    let c10 = texel(x1, y0);
+    let c01 = texel(x0, y1);
+    let c11 = texel(x1, y1);
+
+    let mut out = [0.0_f32; 4];
+    for ch in 0..3 {
+        let top = c00[ch] + (c10[ch] - c00[ch]) * tx;
+        let bot = c01[ch] + (c11[ch] - c01[ch]) * tx;
+        out[ch] = top + (bot - top) * ty;
+    }
+    out[3] = alpha;
+    out
 }

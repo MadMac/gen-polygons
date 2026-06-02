@@ -199,42 +199,20 @@ impl FitnessCalc {
             mapped_at_creation: false,
         });
 
-        let goal_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Goal Texture"),
-            size: wgpu::Extent3d {
-                width: texture_size,
-                height: texture_size,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            // Matches the render target so sampled values land in the same
-            // colour space when the compute shader reads them.
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+        // Precompute the goal's CIELAB once, on the CPU, into a storage buffer
+        // the scoring shader reads directly. The goal is fixed for this
+        // evaluator's lifetime, so re-converting it sRGB→linear→XYZ→Lab on every
+        // dispatch (λ × steps times, including cube roots) is pure waste. A
+        // storage buffer — rather than an Rgba32Float texture — sidesteps the
+        // filterable-float sample-type mismatch the auto-derived bind-group
+        // layout (`layout: None`) would otherwise hit. `goal_to_lab` mirrors the
+        // shader's exact math, so scores only shift in the low bits.
+        let goal_lab: Vec<[f32; 4]> = goal_to_lab(goal_image);
+        let goal_lab_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Goal CIELAB"),
+            contents: bytemuck::cast_slice(&goal_lab),
+            usage: wgpu::BufferUsages::STORAGE,
         });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &goal_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            goal_image.pixels.as_raw(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(texture_size * 4),
-                rows_per_image: Some(texture_size),
-            },
-            wgpu::Extent3d {
-                width: texture_size,
-                height: texture_size,
-                depth_or_array_layers: 1,
-            },
-        );
-        let goal_texture_view = goal_texture.create_view(&Default::default());
 
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Fitness Compute Shader"),
@@ -294,7 +272,7 @@ impl FitnessCalc {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&goal_texture_view),
+                            resource: goal_lab_buffer.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
@@ -368,7 +346,7 @@ impl FitnessCalc {
         );
         let per_candidate_bytes = (MAX_VERTICES as u64) * std::mem::size_of::<Vertex>() as u64;
 
-        // Upload all candidate vertices; zero the whole result buffer.
+        // Upload all candidate vertices.
         for (i, verts) in batch.iter().enumerate() {
             assert!(
                 verts.len() <= MAX_VERTICES,
@@ -381,14 +359,16 @@ impl FitnessCalc {
                 .queue
                 .write_buffer(&inner.vertex_buffer, i as u64 * per_candidate_bytes, bytes);
         }
-        let zeros = vec![0u8; (SLOT_STRIDE * LAMBDA as u64) as usize];
-        inner.queue.write_buffer(&inner.result_buffer, 0, &zeros);
 
         let mut encoder = inner
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Fitness Encoder"),
             });
+        // Zero the result buffer on the GPU before the compute passes atomicAdd
+        // into it — no per-step heap alloc + CPU→GPU copy of zeros. Ordered
+        // before the passes below by the encoder's automatic barriers.
+        encoder.clear_buffer(&inner.result_buffer, 0, None);
 
         for (i, verts) in batch.iter().enumerate() {
             let num_vertices = verts.len() as u32;
@@ -577,6 +557,59 @@ impl FitnessCalc {
             .expect("snapshot buffer size mismatch");
         img.save(path).expect("snapshot write failed");
     }
+}
+
+/// Standard sRGB EOTF (gamma-decode) for one channel in `[0,1]`. Matches what
+/// `Rgba8UnormSrgb` hardware decode applies when the shader loads the render
+/// target, so the CPU-baked goal Lab lands in the same colour space.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear-RGB (sRGB primaries, D65) → CIE XYZ. Same matrix as `fitness.wgsl`.
+fn linear_rgb_to_xyz(r: f32, g: f32, b: f32) -> [f32; 3] {
+    [
+        r * 0.4124564 + g * 0.3575761 + b * 0.1804375,
+        r * 0.2126729 + g * 0.7151522 + b * 0.0721750,
+        r * 0.0193339 + g * 0.119_192 + b * 0.9503041,
+    ]
+}
+
+/// CIE XYZ (D65) → CIELAB. Same constants as `fitness.wgsl`.
+fn xyz_to_lab(xyz: [f32; 3]) -> [f32; 3] {
+    let f = |t: f32| {
+        if t > 0.008856 {
+            t.cbrt()
+        } else {
+            7.787 * t + 16.0 / 116.0
+        }
+    };
+    let fx = f(xyz[0] / 0.95047);
+    let fy = f(xyz[1] / 1.00000);
+    let fz = f(xyz[2] / 1.08883);
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// Bake the goal image to row-major CIELAB, one `[L, a, b, 0]` per pixel (the
+/// trailing 0 keeps the storage element 16-byte aligned for the shader's
+/// `array<vec4<f32>>`). Runs once per `FitnessCalc`; mirrors the shader's
+/// sRGB→linear→XYZ→Lab path so scores only shift in the low bits.
+fn goal_to_lab(goal: &GoalImage) -> Vec<[f32; 4]> {
+    goal
+        .pixels
+        .pixels()
+        .map(|p| {
+            let r = srgb_to_linear(p[0] as f32 / 255.0);
+            let g = srgb_to_linear(p[1] as f32 / 255.0);
+            let b = srgb_to_linear(p[2] as f32 / 255.0);
+            let lab = xyz_to_lab(linear_rgb_to_xyz(r, g, b));
+            [lab[0], lab[1], lab[2], 0.0]
+        })
+        .collect()
 }
 
 /// Build one `FitnessCalc` per pyramid level. Level indices match `Phase::pyramid_level`.
