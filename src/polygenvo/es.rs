@@ -58,11 +58,21 @@ pub(crate) struct Phase {
 // Coarse-to-fine schedule: pyramid level + initial σ per phase, with a capacity
 // cap that rises to MAX_TRIANGLES at the finest level. Promotion advances this
 // schedule on plateau; the genome grows toward each cap via `split`.
+// Gradual ~2× cap ramp: each phase roughly doubles the triangle budget (one
+// subdivision round), and promotion is plateau-gated, so the search optimises
+// the current set before it is allowed to grow again. Coarse counts live at
+// coarse pyramid levels (big blocks first); detail only accrues at 512². σ
+// shrinks as triangles get smaller so moves stay proportional to triangle size.
 const PHASES: &[Phase] = &[
-    Phase { cap: 300,           pyramid_level: 0, initial_sigma_pos: 0.30, initial_sigma_col: 0.20, initial_sigma_grad: 0.20 }, // 128² coarse
-    Phase { cap: 800,           pyramid_level: 1, initial_sigma_pos: 0.18, initial_sigma_col: 0.12, initial_sigma_grad: 0.12 }, // 256² medium
-    Phase { cap: 2000,          pyramid_level: 2, initial_sigma_pos: 0.10, initial_sigma_col: 0.08, initial_sigma_grad: 0.08 }, // 512² fine
-    Phase { cap: MAX_TRIANGLES, pyramid_level: 2, initial_sigma_pos: 0.05, initial_sigma_col: 0.04, initial_sigma_grad: 0.04 }, // 512² finest
+    Phase { cap: 48,            pyramid_level: 0, initial_sigma_pos: 0.30, initial_sigma_col: 0.20, initial_sigma_grad: 0.20 }, // 128²
+    Phase { cap: 96,            pyramid_level: 0, initial_sigma_pos: 0.25, initial_sigma_col: 0.16, initial_sigma_grad: 0.16 }, // 128²
+    Phase { cap: 192,           pyramid_level: 1, initial_sigma_pos: 0.18, initial_sigma_col: 0.12, initial_sigma_grad: 0.12 }, // 256²
+    Phase { cap: 384,           pyramid_level: 1, initial_sigma_pos: 0.14, initial_sigma_col: 0.10, initial_sigma_grad: 0.10 }, // 256²
+    Phase { cap: 768,           pyramid_level: 2, initial_sigma_pos: 0.10, initial_sigma_col: 0.08, initial_sigma_grad: 0.08 }, // 512²
+    Phase { cap: 1536,          pyramid_level: 2, initial_sigma_pos: 0.08, initial_sigma_col: 0.06, initial_sigma_grad: 0.06 }, // 512²
+    Phase { cap: 3072,          pyramid_level: 2, initial_sigma_pos: 0.06, initial_sigma_col: 0.05, initial_sigma_grad: 0.05 }, // 512²
+    Phase { cap: 6144,          pyramid_level: 2, initial_sigma_pos: 0.05, initial_sigma_col: 0.04, initial_sigma_grad: 0.04 }, // 512²
+    Phase { cap: MAX_TRIANGLES, pyramid_level: 2, initial_sigma_pos: 0.04, initial_sigma_col: 0.03, initial_sigma_grad: 0.03 }, // 512² finest
 ];
 
 pub(crate) struct EsConfig {
