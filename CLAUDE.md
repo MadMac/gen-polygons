@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project purpose
 
-Experimental playground for `wgpu`, shaders, and genetic algorithms. The goal is to approximate a raster image (`goal.png` at the repo root) by evolving a population of colored triangles. There is one tiny smoke test (a 30-step ES on a 32×32 synthetic checker) but no CI — substantive changes are still evaluated by running the simulation and eyeballing output frames in `triangles/`.
+Experimental playground for `wgpu`, shaders, and genetic algorithms. The goal is to approximate a raster image (`goal.png` at the repo root) by evolving a population of colored triangles. There is a small test suite (per-module unit tests plus one GPU smoke test — a 30-step ES on a 32×32 synthetic checker) but no CI — substantive changes are still evaluated by running the simulation and eyeballing output frames in `triangles/`.
 
 ## Commands
 
 - `cargo build --release --bin polygenvo` — release build; effectively required because the ES does many GPU renders per step.
 - `cargo run --release --bin polygenvo` — runs the simulation; needs `goal.png` and `triangles/` in CWD.
 - `cargo build --bin polygenvo` — debug build; useful when iterating on Rust code paths.
-- `cargo test --bin polygenvo` — runs the smoke test (`ga_improves_on_synthetic_checker`). Fast (~0.1s) and requires a working wgpu adapter on the host.
+- `cargo test --bin polygenvo` — runs the test suite (per-module unit tests + the GPU smoke test `es::tests::ga_improves_on_synthetic_checker`). Fast (~0.1s) and requires a working wgpu adapter on the host.
 
 Runtime requirements for `polygenvo`:
 - `goal.png` must exist in the working directory (square RGBA PNG; `texture_size` is taken from its width).
@@ -23,20 +23,18 @@ Only one binary lives in the repo: [`polygenvo`](src/polygenvo/main.rs). When th
 
 ## High-level architecture (polygenvo)
 
-[main.rs](src/polygenvo/main.rs) is ~970 lines and wires together three layers:
+[main.rs](src/polygenvo/main.rs) is a thin entry point — `env_logger::init → goal::load_goal_image("goal.png") → block_on(gpu::init_wgpu()) → es::run_es(EsConfig::production())` — that just declares the modules below. The code is split into single-responsibility modules under `src/polygenvo/`, layered low → high (each only depends on the ones above it):
 
-1. **Genome** — `Vertex { position: [f32;3], color: [f32;4] }` matching the wgpu vertex layout exactly (it's `bytemuck::Pod`, so the genome buffer is `cast_slice`'d straight to a vertex buffer). A genome is a `Vec<Vertex>` interpreted as a `TriangleList`, so length must stay a multiple of 3. Triangles are seeded by sampling colours from the goal at random clip-space points: see `random_color_seeded_triangle` (centres in `(-0.9, 0.9)`, radii scaled by `max_radius`, CCW winding for `front_face: Ccw, cull_mode: Back`).
+- **[goal.rs](src/polygenvo/goal.rs)** — `GoalImage` (RGBA8 wrapper with a compact `Debug`), `load_goal_image`, `downsample_goal` (Lanczos, for pyramid levels), `sample_goal_color` (clip-space point → goal pixel; image y is flipped).
+- **[genome.rs](src/polygenvo/genome.rs)** — `Vertex { position: [f32;3], color: [f32;4] }` matching the wgpu vertex layout exactly (`bytemuck::Pod`, so the genome is `cast_slice`'d straight to a vertex buffer). A genome is a `Vec<Vertex>` interpreted as a `TriangleList`, so length stays a multiple of 3. Holds the capacity constants (`MAX_TRIANGLES`/`MAX_VERTICES`/`INITIAL_TRIANGLES`), `triangle_centroid`, `seeded_triangle` (the shared CCW-triangle builder — uniform and error-guided seeding both call it, differing only in how the centre is chosen; CCW for `front_face: Ccw, cull_mode: Back`), `init_genome`, and `split_triangle` (4-way midpoint subdivision).
+- **[gpu.rs](src/polygenvo/gpu.rs)** — `init_wgpu` (GL backend, high-performance adapter) → `Arc<Device>` / `Arc<Queue>`.
+- **[fitness.rs](src/polygenvo/fitness.rs)** — the GPU evaluator. `FitnessCalc::fitness_of_batch(&[&[Vertex]]) -> Vec<Eval>` renders each candidate into an offscreen `Rgba8UnormSrgb` target (real OVER alpha blending; MSAA only on the finest level), then dispatches [fitness.wgsl](src/polygenvo/fitness.wgsl) to score it and emit a 16×16 residual-error grid. The compute shader converts rendered+goal pixels linear-RGB → CIE XYZ → CIELAB, takes per-pixel ΔE76, and `atomicAdd`s a workgroup-reduced sum (scaled by `FITNESS_SCALE`) into one `u32`. Rust maps the accumulator to a similarity score in `[0, 1_000_000]`, **higher = better**. `FitnessCalc` is `Clone`-by-`Arc`. GPU-layout constants (`LAMBDA`, `FITNESS_SCALE`, `ERROR_GRID_DIM`/`GRID_CELLS`, slot strides, `MSAA_SAMPLE_COUNT`) and `build_pyramid` live here.
+- **[variation.rs](src/polygenvo/variation.rs)** — the mutation operators. `mutate` picks one operator from a named weighted table (`OPERATORS`, weights summing to 100; `pick_op` roulette) and applies it, returning `(child, OpKind)`. Operators: vertex nudge, recolour, alpha nudge, `split` (the only growth path — fitness-gated subdivision via `grow_by_split`), z-swap, error-seeded add, relocate, delete. `OpKind` (Positional/Chromatic/Structural) classes which step size an op exercises; `StepSizes { pos, col }` carries the two σ. Also `gaussian` (Box-Muller), `sample_error_cell`, `cell_to_clip`.
+- **[es.rs](src/polygenvo/es.rs)** — the search driver. `pub(crate) fn run_es(device, queue, goal, cfg: EsConfig) -> EsResult` runs a **(1+λ)-ES** over the coarse-to-fine `PHASES` schedule: each step generates `cfg.lambda` candidates, scores them in one batch, accepts the best improver. Two extracted structs own the fiddly state — **`OneFifthRule`** (current σ pair + the 1/5-success-rule window, with a single `reset_window` so the per-type tallies can't drift) and **`PhaseSchedule`** (phase index, in-phase step count, plateau detection via `check_plateau`). On plateau, promotion raises the cap and re-scores at a finer pyramid level; the genome grows organically via `split` (no batch growth). ES tunables (`SIGMA_*`, `SIGMA_WINDOW`, `PHASE_MIN_STEPS`, `PLATEAU_WINDOW`, `PLATEAU_ACCEPTS`, `MAX_STEPS`, `MIN_TRIANGLES`) live here.
 
-2. **Fitness (`FitnessCalc`)** — `fitness_of(&[Vertex])` does a full wgpu render of the triangles into an offscreen `Rgba8UnormSrgb` texture, then dispatches [fitness.wgsl](src/polygenvo/fitness.wgsl) to score it against the goal. The compute shader converts both rendered and goal pixels through linear-RGB → CIE XYZ → CIELAB, takes the per-pixel ΔE76 distance, normalises by 250, scales by 1000, and `atomicAdd`s into a single `u32` accumulator. Rust then maps the accumulator to a similarity score in `[0, 1_000_000]` where **higher = better fit**. `FitnessCalc` is `Clone`-by-`Arc` (the inner struct holds the device/queue/pipelines/buffers behind `Arc`); cloning is cheap and shares all GPU resources.
+Both `run_es` and the smoke test drive the same code path. The coarse-to-fine schedule is `const PHASES: &[Phase]` (each phase: `cap`, `pyramid_level`, `initial_sigma_pos`, `initial_sigma_col`); `run_es` takes phases via `EsConfig.phases` — production uses `PHASES.to_vec()`, tests use a single-element `Vec`.
 
-3. **ES driver** — Hand-rolled **(1+λ)-ES** with a coarse-to-fine phase schedule. Each step generates `LAMBDA` mutated candidates from the current parent (`mutate(...)` applies position/colour/alpha jitter and occasional add/delete-triangle operations), evaluates them on a goal pyramid, and accepts the best if it beats the parent. Sigma self-adapts via the **1/5 success rule** evaluated over `SIGMA_WINDOW` steps. Phase promotion fires when the last `PLATEAU_WINDOW` steps produced fewer than `PLATEAU_ACCEPTS` improvements; promotion bumps the triangle count and switches to a finer pyramid level. No `genevo`, no crossover, no population.
-
-The ES loop is **extracted into `pub fn run_es(device, queue, goal, cfg: EsConfig) -> EsResult`** so both production and the smoke test exercise the same code. `main()` is a thin wrapper: `env_logger::init → load_goal_image("goal.png") → block_on(init_wgpu()) → run_es(EsConfig::production())`.
-
-Tunable constants at the top of [main.rs](src/polygenvo/main.rs):
-- `MAX_VERTICES`, `LAMBDA`, `SIGMA_WINDOW`, `PHASE_MIN_STEPS`, `PLATEAU_WINDOW`, `PLATEAU_ACCEPTS`, `SNAPSHOT_EVERY_IMPROVEMENT`, `MAX_STEPS`.
-
-The coarse-to-fine schedule is `const PHASES: &[Phase] = &[...]` with `triangles`, `pyramid_level`, and `initial_sigma` per phase. `run_es` takes its phases via `EsConfig.phases: Vec<Phase>` — production uses `PHASES.to_vec()`; the smoke test uses a single-element `Vec`.
+Tunable constants now live next to the module that owns them (genome capacity in `genome.rs`, GPU/grid layout in `fitness.rs`, ES schedule/σ in `es.rs`) rather than one block at the top of `main.rs`. Tests are a `#[cfg(test)] mod tests` in each module, with shared fixtures in [test_support.rs](src/polygenvo/test_support.rs).
 
 ## Shader pipeline
 
@@ -57,7 +55,7 @@ WGSL syntax is **current (post-1.0)**: `@location(0)`, `@vertex`/`@fragment`/`@c
 
 ## Conventions when editing
 
-- When changing tunables, verify both the `const` at the top and any `PHASES` entries that override per-phase values (`initial_sigma` is per-phase; `LAMBDA` and `MAX_STEPS` are global).
+- Tunables live next to their owning module (see the architecture map). When changing one, check any `PHASES` entries that override per-phase values (`initial_sigma_pos`/`initial_sigma_col` are per-phase; `LAMBDA` and `MAX_STEPS` are global). `LAMBDA` is defined in `fitness.rs` because it sizes the GPU batch buffers; `cfg.lambda` must stay ≤ it (asserted in `fitness_of_batch`).
 - The fitness direction is **higher = better**. Code that compares fitnesses uses `>` for "improvement".
-- The smoke test is the only regression guard — if you change `run_es`, `FitnessCalc`, or either `.wgsl`, run `cargo test --bin polygenvo` before assuming the change is safe.
+- Tests are the regression guard — the GPU smoke test covers `run_es`/`FitnessCalc`/the `.wgsl` pipeline, and the per-module unit tests cover the pure logic (`OneFifthRule`/`PhaseSchedule`, the operator table, geometry helpers). Run `cargo test --bin polygenvo` (and `cargo clippy --bin polygenvo`, which is kept clean) before assuming a change is safe.
 - PNG snapshots are gated on `cfg.snapshot_every`: production sets `Some(SNAPSHOT_EVERY_IMPROVEMENT)`, the smoke test sets `None`. When adding new snapshot sites, gate them too.
