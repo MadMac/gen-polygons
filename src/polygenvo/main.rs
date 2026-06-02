@@ -17,6 +17,20 @@ use futures::executor::block_on;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Value of a `--flag <value>` (or `--flag=value`) command-line argument, if present.
+fn arg_value(flag: &str) -> Option<String> {
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if a == flag {
+            return args.next();
+        }
+        if let Some(v) = a.strip_prefix(&format!("{flag}=")) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
 fn main() {
     env_logger::init();
 
@@ -31,7 +45,9 @@ fn main() {
     // gracefully (the same final-snapshot/summary path as Ctrl-C).
     let show_window = std::env::args().any(|a| a == "--show-window");
 
-    let goal = goal::load_goal_image("goal.png");
+    // `--goal <path>`: image to approximate. Defaults to goal.png.
+    let goal_path = arg_value("--goal").unwrap_or_else(|| "goal.png".to_string());
+    let goal = goal::load_goal_image(&goal_path);
 
     // In windowed mode the device must be compatible with the window surface, so
     // `window::init_window` brings up both the window and the device together;

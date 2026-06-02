@@ -9,14 +9,15 @@ Experimental playground for `wgpu`, shaders, and genetic algorithms. The goal is
 ## Commands
 
 - `cargo build --release --bin polygenvo` — release build; effectively required because the ES does many GPU renders per step.
-- `cargo run --release --bin polygenvo` — runs the simulation; needs `goal.png` and `triangles/` in CWD.
+- `cargo run --release --bin polygenvo` — runs the simulation; needs `goal.png` (or `--goal <path>`) and `triangles/` in CWD.
+- `cargo run --release --bin polygenvo -- --goal <path>` — approximate a different image instead of the default `goal.png`. Accepts `--goal path` or `--goal=path` (parsed by `arg_value` in `main.rs`); composable with the other flags.
 - `cargo run --release --bin polygenvo -- --infinite` — same, but drops the `MAX_STEPS` ceiling and runs until Ctrl-C. A `ctrlc` handler in `main.rs` flips `EsConfig.stop_flag` (an `Arc<AtomicBool>`); `run_es` checks it each step and exits cleanly via the normal final-snapshot/summary path instead of being hard-killed mid-step.
 - `cargo run --release --bin polygenvo -- --show-window` — opens a live window (winit) that renders the current best candidate, refreshed on each accepted improvement (throttled to ~display rate). Composable with `--infinite`. Closing the window stops the run gracefully (same final-snapshot/summary path as Ctrl-C). Needs a display server; in windowed mode the wgpu device is created by `window::init_window` (so the adapter is surface-compatible) instead of `gpu::init_wgpu`.
 - `cargo build --bin polygenvo` — debug build; useful when iterating on Rust code paths.
 - `cargo test --bin polygenvo` — runs the test suite (per-module unit tests + the GPU smoke test `es::tests::ga_improves_on_synthetic_checker`). Fast (~0.1s) and requires a working wgpu adapter on the host.
 
 Runtime requirements for `polygenvo`:
-- `goal.png` must exist in the working directory (square RGBA PNG; `texture_size` is taken from its width).
+- `goal.png` (or the file named by `--goal <path>`) must exist in the working directory (square RGBA PNG; `texture_size` is taken from its width).
 - Snapshots go to a fresh per-run subfolder `triangles/<local-timestamp>/` (e.g. `triangles/2026-06-02_12-56-43/`) that `run_es` creates on startup via `create_dir_all` (so `triangles/` need not pre-exist). `run_timestamp()` in `es.rs` names it in the user's local timezone via `chrono::Local::now()`. Frames are `imageN.png`/`final.png` inside it. `triangles/` is gitignored.
 
 ## Binaries
@@ -25,7 +26,7 @@ Only one binary lives in the repo: [`polygenvo`](src/polygenvo/main.rs). When th
 
 ## High-level architecture (polygenvo)
 
-[main.rs](src/polygenvo/main.rs) is a thin entry point — `env_logger::init → goal::load_goal_image("goal.png") → block_on(gpu::init_wgpu()) → es::run_es(EsConfig::production())` — that just declares the modules below. The code is split into single-responsibility modules under `src/polygenvo/`, layered low → high (each only depends on the ones above it):
+[main.rs](src/polygenvo/main.rs) is a thin entry point — `env_logger::init → goal::load_goal_image(--goal or "goal.png") → block_on(gpu::init_wgpu()) → es::run_es(EsConfig::production())` — that just declares the modules below. The code is split into single-responsibility modules under `src/polygenvo/`, layered low → high (each only depends on the ones above it):
 
 - **[goal.rs](src/polygenvo/goal.rs)** — `GoalImage` (RGBA8 wrapper with a compact `Debug`), `load_goal_image`, `downsample_goal` (Lanczos, for pyramid levels), `sample_goal_color` (clip-space point → goal pixel; image y is flipped).
 - **[genome.rs](src/polygenvo/genome.rs)** — `Vertex { position: [f32;3], color: [f32;4] }` matching the wgpu vertex layout exactly (`bytemuck::Pod`, so the genome is `cast_slice`'d straight to a vertex buffer). A genome is a `Vec<Vertex>` interpreted as a `TriangleList`, so length stays a multiple of 3. Holds the capacity constants (`MAX_TRIANGLES`/`MAX_VERTICES`/`INITIAL_TRIANGLES`), `triangle_centroid`, `seeded_triangle` (the shared CCW-triangle builder — uniform and error-guided seeding both call it, differing only in how the centre is chosen; CCW for `front_face: Ccw, cull_mode: Back`), `init_genome`, and `split_triangle` (4-way midpoint subdivision).
