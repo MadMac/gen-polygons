@@ -6,6 +6,7 @@ use crate::genome::{init_genome, Vertex, INITIAL_TRIANGLES, MAX_TRIANGLES};
 use crate::goal::GoalImage;
 use crate::variation::{mutate, OpKind, StepSizes};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -35,6 +36,10 @@ const SIGMA_POS_MIN: f32 = 0.005;
 const SIGMA_POS_MAX: f32 = 0.5;
 const SIGMA_COL_MIN: f32 = 0.003;
 const SIGMA_COL_MAX: f32 = 0.4;
+// Single-vertex (gradient) recolour lives in the same [0,1] colour space as
+// whole-triangle recolour, so it reuses the colour clamps but adapts separately.
+const SIGMA_GRAD_MIN: f32 = 0.003;
+const SIGMA_GRAD_MAX: f32 = 0.4;
 
 #[derive(Clone)]
 pub(crate) struct Phase {
@@ -45,16 +50,19 @@ pub(crate) struct Phase {
     // Initial step sizes for this phase, self-adapted by per-type 1/5 rules.
     initial_sigma_pos: f32,
     initial_sigma_col: f32,
+    // Gradient (single-vertex recolour) σ starts level with the colour σ and
+    // diverges from it under adaptation.
+    initial_sigma_grad: f32,
 }
 
 // Coarse-to-fine schedule: pyramid level + initial σ per phase, with a capacity
 // cap that rises to MAX_TRIANGLES at the finest level. Promotion advances this
 // schedule on plateau; the genome grows toward each cap via `split`.
 const PHASES: &[Phase] = &[
-    Phase { cap: 300,           pyramid_level: 0, initial_sigma_pos: 0.30, initial_sigma_col: 0.20 }, // 128² coarse
-    Phase { cap: 800,           pyramid_level: 1, initial_sigma_pos: 0.18, initial_sigma_col: 0.12 }, // 256² medium
-    Phase { cap: 2000,          pyramid_level: 2, initial_sigma_pos: 0.10, initial_sigma_col: 0.08 }, // 512² fine
-    Phase { cap: MAX_TRIANGLES, pyramid_level: 2, initial_sigma_pos: 0.05, initial_sigma_col: 0.04 }, // 512² finest
+    Phase { cap: 300,           pyramid_level: 0, initial_sigma_pos: 0.30, initial_sigma_col: 0.20, initial_sigma_grad: 0.20 }, // 128² coarse
+    Phase { cap: 800,           pyramid_level: 1, initial_sigma_pos: 0.18, initial_sigma_col: 0.12, initial_sigma_grad: 0.12 }, // 256² medium
+    Phase { cap: 2000,          pyramid_level: 2, initial_sigma_pos: 0.10, initial_sigma_col: 0.08, initial_sigma_grad: 0.08 }, // 512² fine
+    Phase { cap: MAX_TRIANGLES, pyramid_level: 2, initial_sigma_pos: 0.05, initial_sigma_col: 0.04, initial_sigma_grad: 0.04 }, // 512² finest
 ];
 
 pub(crate) struct EsConfig {
@@ -62,6 +70,10 @@ pub(crate) struct EsConfig {
     pub(crate) max_steps: u64,
     pub(crate) lambda: usize,
     pub(crate) snapshot_every: Option<u64>,
+    // When set, the loop stops at the end of the current step once this flips to
+    // `true` (a Ctrl-C handler in `main` drives it for `--infinite` runs), then
+    // falls through to the normal final-snapshot/summary path.
+    pub(crate) stop_flag: Option<Arc<AtomicBool>>,
 }
 
 impl EsConfig {
@@ -71,6 +83,7 @@ impl EsConfig {
             max_steps: MAX_STEPS,
             lambda: LAMBDA,
             snapshot_every: Some(SNAPSHOT_EVERY_IMPROVEMENT),
+            stop_flag: None,
         }
     }
 }
@@ -93,17 +106,21 @@ struct OneFifthRule {
     pos_better: u64,
     col_gen: u64,
     col_better: u64,
+    grad_gen: u64,
+    grad_better: u64,
 }
 
 impl OneFifthRule {
     fn new(phase: &Phase) -> Self {
         let mut r = Self {
-            sigmas: StepSizes { pos: 0.0, col: 0.0 },
+            sigmas: StepSizes { pos: 0.0, col: 0.0, grad: 0.0 },
             window_steps: 0,
             pos_gen: 0,
             pos_better: 0,
             col_gen: 0,
             col_better: 0,
+            grad_gen: 0,
+            grad_better: 0,
         };
         r.restart(phase);
         r
@@ -115,6 +132,7 @@ impl OneFifthRule {
         self.sigmas = StepSizes {
             pos: phase.initial_sigma_pos,
             col: phase.initial_sigma_col,
+            grad: phase.initial_sigma_grad,
         };
         self.reset_window();
     }
@@ -126,6 +144,8 @@ impl OneFifthRule {
         self.pos_better = 0;
         self.col_gen = 0;
         self.col_better = 0;
+        self.grad_gen = 0;
+        self.grad_better = 0;
     }
 
     /// Tally one generated candidate (and whether it beat the parent) against
@@ -139,6 +159,10 @@ impl OneFifthRule {
             OpKind::Chromatic => {
                 self.col_gen += 1;
                 self.col_better += improved as u64;
+            }
+            OpKind::Gradient => {
+                self.grad_gen += 1;
+                self.grad_better += improved as u64;
             }
             OpKind::Structural => {}
         }
@@ -159,6 +183,10 @@ impl OneFifthRule {
         if self.col_gen > 0 {
             let rate = self.col_better as f32 / self.col_gen as f32;
             self.sigmas.col = adapt_sigma(self.sigmas.col, rate, SIGMA_COL_MIN, SIGMA_COL_MAX);
+        }
+        if self.grad_gen > 0 {
+            let rate = self.grad_better as f32 / self.grad_gen as f32;
+            self.sigmas.grad = adapt_sigma(self.sigmas.grad, rate, SIGMA_GRAD_MIN, SIGMA_GRAD_MAX);
         }
         self.reset_window();
     }
@@ -231,8 +259,8 @@ fn score(calc: &FitnessCalc, genome: &[Vertex]) -> (usize, Vec<u32>) {
 /// One-line phase banner: `<label> | cap … | level …² | σ … | fitness …`.
 fn log_phase(label: &str, phase: &Phase, level_size: u32, sigmas: StepSizes, fitness: usize) {
     println!(
-        "{label} | cap {} | level {} ({}²) | σ_pos={:.3} σ_col={:.3} | fitness {}",
-        phase.cap, phase.pyramid_level, level_size, sigmas.pos, sigmas.col, fitness
+        "{label} | cap {} | level {} ({}²) | σ_pos={:.3} σ_col={:.3} σ_grad={:.3} | fitness {}",
+        phase.cap, phase.pyramid_level, level_size, sigmas.pos, sigmas.col, sigmas.grad, fitness
     );
 }
 
@@ -280,6 +308,12 @@ pub(crate) fn run_es(
     }
 
     while step < cfg.max_steps {
+        // Graceful stop (e.g. Ctrl-C in `--infinite` mode): leave the loop at a
+        // step boundary so the final snapshot and summary below still run.
+        if cfg.stop_flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
+            println!("Stop requested — halting at step {step}.");
+            break;
+        }
         let phase = &cfg.phases[schedule.idx];
         let calc = &pyramid[phase.pyramid_level];
         // `split`/`add` may grow the genome up to this phase's cap; `delete` may
@@ -342,12 +376,13 @@ pub(crate) fn run_es(
         // Periodic progress log (rate-limited so output stays readable).
         if last_log.elapsed().as_secs_f32() >= 1.0 {
             println!(
-                "step {:>6} | phase {} | tris {:>3} | σ_pos={:.3} σ_col={:.3} | fit {:>7} | improvements {} | {:.1}/s",
+                "step {:>6} | phase {} | tris {:>3} | σ_pos={:.3} σ_col={:.3} σ_grad={:.3} | fit {:>7} | improvements {} | {:.1}/s",
                 step,
                 schedule.idx,
                 current.len() / 3,
                 sigma.sigmas.pos,
                 sigma.sigmas.col,
+                sigma.sigmas.grad,
                 current_fitness,
                 improvements_total,
                 step as f64 / started.elapsed().as_secs_f64()
@@ -387,8 +422,8 @@ pub(crate) fn run_es(
                 sigma.restart(phase);
                 schedule.restart_phase();
                 println!(
-                    "⤴ Sigma restart (no further phases) | σ_pos {:.3}→{:.3} σ_col {:.3}→{:.3}",
-                    old.pos, sigma.sigmas.pos, old.col, sigma.sigmas.col
+                    "⤴ Sigma restart (no further phases) | σ_pos {:.3}→{:.3} σ_col {:.3}→{:.3} σ_grad {:.3}→{:.3}",
+                    old.pos, sigma.sigmas.pos, old.col, sigma.sigmas.col, old.grad, sigma.sigmas.grad
                 );
             }
         }
@@ -418,7 +453,13 @@ mod tests {
     use crate::test_support::{init_test_wgpu, make_checker_goal};
 
     fn test_phase(sp: f32, sc: f32) -> Phase {
-        Phase { cap: 100, pyramid_level: 0, initial_sigma_pos: sp, initial_sigma_col: sc }
+        Phase {
+            cap: 100,
+            pyramid_level: 0,
+            initial_sigma_pos: sp,
+            initial_sigma_col: sc,
+            initial_sigma_grad: sc,
+        }
     }
 
     #[test]
@@ -459,11 +500,34 @@ mod tests {
 
         // reset_window zeroes every rolling tally.
         r.record(OpKind::Positional, true);
+        r.record(OpKind::Gradient, true);
         r.reset_window();
         assert_eq!(
-            (r.window_steps, r.pos_gen, r.pos_better, r.col_gen, r.col_better),
-            (0, 0, 0, 0, 0)
+            (
+                r.window_steps,
+                r.pos_gen,
+                r.pos_better,
+                r.col_gen,
+                r.col_better,
+                r.grad_gen,
+                r.grad_better
+            ),
+            (0, 0, 0, 0, 0, 0, 0)
         );
+    }
+
+    #[test]
+    fn one_fifth_rule_adapts_grad_independently() {
+        let mut r = OneFifthRule::new(&test_phase(0.1, 0.1));
+        // A full window of always-improving gradient candidates grows σ_grad
+        // alone; σ_pos and σ_col are untouched (no candidates of their class).
+        for _ in 0..SIGMA_WINDOW {
+            r.record(OpKind::Gradient, true);
+            r.end_step();
+        }
+        assert!(r.sigmas.grad > 0.1, "σ_grad should grow on a high success rate");
+        assert_eq!(r.sigmas.pos, 0.1, "σ_pos untouched without positional candidates");
+        assert_eq!(r.sigmas.col, 0.1, "σ_col untouched without chromatic candidates");
     }
 
     #[test]
@@ -510,6 +574,7 @@ mod tests {
             pyramid_level: 0,
             initial_sigma_pos: 0.1,
             initial_sigma_col: 0.1,
+            initial_sigma_grad: 0.1,
         }];
         let result = run_es(
             device,
@@ -520,6 +585,7 @@ mod tests {
                 max_steps: 30,
                 lambda: 4,
                 snapshot_every: None,
+                stop_flag: None,
             },
         );
         assert!(

@@ -10,6 +10,7 @@ Experimental playground for `wgpu`, shaders, and genetic algorithms. The goal is
 
 - `cargo build --release --bin polygenvo` — release build; effectively required because the ES does many GPU renders per step.
 - `cargo run --release --bin polygenvo` — runs the simulation; needs `goal.png` and `triangles/` in CWD.
+- `cargo run --release --bin polygenvo -- --infinite` — same, but drops the `MAX_STEPS` ceiling and runs until Ctrl-C. A `ctrlc` handler in `main.rs` flips `EsConfig.stop_flag` (an `Arc<AtomicBool>`); `run_es` checks it each step and exits cleanly via the normal final-snapshot/summary path instead of being hard-killed mid-step.
 - `cargo build --bin polygenvo` — debug build; useful when iterating on Rust code paths.
 - `cargo test --bin polygenvo` — runs the test suite (per-module unit tests + the GPU smoke test `es::tests::ga_improves_on_synthetic_checker`). Fast (~0.1s) and requires a working wgpu adapter on the host.
 
@@ -49,7 +50,7 @@ WGSL syntax is **current (post-1.0)**: `@location(0)`, `@vertex`/`@fragment`/`@c
 
 ## Dependency versions
 
-`Cargo.toml` is on a current ecosystem snapshot: `wgpu = "29"`, `image = "0.25"`, `env_logger = "0.11"`, `rand = "0.10"`, `bytemuck = "1"`, `futures = "0.3"`, `log = "0.4"`. Rust edition is `"2024"`.
+`Cargo.toml` is on a current ecosystem snapshot: `wgpu = "29"`, `image = "0.25"`, `env_logger = "0.11"`, `rand = "0.10"`, `bytemuck = "1"`, `futures = "0.3"`, `log = "0.4"`, `ctrlc = "3"` (graceful Ctrl-C for `--infinite`). Rust edition is `"2024"`.
 
 `rand 0.10` notes for editing: use `rand::rng()` (not `thread_rng()`) and `rng.random_range(a..b)` (not `gen_range`). The `gen` keyword is reserved in edition 2024; if a method name collides it must be escaped as `r#gen`.
 

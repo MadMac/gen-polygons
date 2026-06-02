@@ -13,18 +13,21 @@ use rand::prelude::*;
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum OpKind {
     Positional, // vertex nudge -> sigma.pos
-    Chromatic,  // recolour / alpha -> sigma.col
+    Chromatic,  // whole-triangle recolour / alpha -> sigma.col
+    Gradient,   // single-vertex recolour -> sigma.grad
     Structural, // add / delete / z-swap / relocate -> no step size
 }
 
-/// The two self-adapted Gaussian step sizes a `mutate` call uses: `pos` for
-/// vertex nudges (clip space), `col` for recolour/alpha (colour space). They
-/// travel together because every mutation needs both and the 1/5 rule adapts
-/// them as a pair.
+/// The three self-adapted Gaussian step sizes a `mutate` call uses: `pos` for
+/// vertex nudges (clip space), `col` for whole-triangle recolour/alpha, and
+/// `grad` for single-vertex recolour (the gradient knob). They travel together
+/// because a mutation may need any of them and the 1/5 rule adapts each
+/// independently against its own success rate.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct StepSizes {
     pub(crate) pos: f32,
     pub(crate) col: f32,
+    pub(crate) grad: f32,
 }
 
 /// The mutation operators `mutate` dispatches between. Selection probabilities
@@ -34,6 +37,7 @@ pub(crate) struct StepSizes {
 enum Op {
     NudgeVertex,
     Recolor,
+    RecolorVertex,
     NudgeAlpha,
     Split,
     SwapZ,
@@ -49,6 +53,7 @@ impl Op {
         match self {
             Op::NudgeVertex => OpKind::Positional,
             Op::Recolor | Op::NudgeAlpha => OpKind::Chromatic,
+            Op::RecolorVertex => OpKind::Gradient,
             Op::Split | Op::SwapZ | Op::AddTriangle | Op::Relocate | Op::Delete => {
                 OpKind::Structural
             }
@@ -57,11 +62,14 @@ impl Op {
 }
 
 /// `(operator, weight)` selection table; weights need not sum to any particular
-/// value — `pick_op` normalises by their total. These mirror the previous
-/// hand-tuned `0..100` ranges (38/24/12/10/5/5/3/3).
+/// value — `pick_op` normalises by their total. `RecolorVertex` (the gradient
+/// knob) takes its budget from whole-triangle `Recolor` (24 → 16 + 8) so total
+/// chromatic effort is roughly preserved; the rest mirror the previous
+/// hand-tuned ranges.
 const OPERATORS: &[(Op, u32)] = &[
     (Op::NudgeVertex, 38),
-    (Op::Recolor, 24),
+    (Op::Recolor, 16),
+    (Op::RecolorVertex, 8),
     (Op::NudgeAlpha, 12),
     (Op::Split, 10),
     (Op::SwapZ, 5),
@@ -178,8 +186,9 @@ fn grow_by_split(
 
 /// Apply one random mutation to a clone of `parent`, returning the child and the
 /// `OpKind` it exercised (for per-type step-size adaptation). Positional nudges
-/// use `sigma_pos`; recolour/alpha use `sigma_col`; both are Gaussian. Structural
-/// changes (add/delete/z-swap) happen rarely and carry no step size.
+/// use `sigmas.pos`; whole-triangle recolour/alpha use `sigmas.col`; single-vertex
+/// recolour uses `sigmas.grad`; all are Gaussian. Structural changes
+/// (add/delete/z-swap/relocate) happen rarely and carry no step size.
 pub(crate) fn mutate(
     parent: &[Vertex],
     sigmas: StepSizes,
@@ -218,6 +227,18 @@ pub(crate) fn mutate(
                 c[1] = (c[1] + dg).clamp(0.0, 1.0);
                 c[2] = (c[2] + db).clamp(0.0, 1.0);
             }
+        }
+        Op::RecolorVertex => {
+            // Recolour a single vertex's RGB (Gaussian, sigmas.grad). This is the
+            // only operator that can turn a flat triangle into a gradient —
+            // `Recolor` moves all three vertices by one shared delta and so can
+            // never break their colour apart.
+            let t = rng.random_range(0..n);
+            let v = rng.random_range(0..3);
+            let c = &mut child[t * 3 + v].color;
+            c[0] = (c[0] + gaussian(rng, sigmas.grad)).clamp(0.0, 1.0);
+            c[1] = (c[1] + gaussian(rng, sigmas.grad)).clamp(0.0, 1.0);
+            c[2] = (c[2] + gaussian(rng, sigmas.grad)).clamp(0.0, 1.0);
         }
         Op::NudgeAlpha => {
             // Nudge the alpha of one triangle (Gaussian, sigmas.col).
@@ -310,9 +331,40 @@ mod tests {
         assert_eq!(Op::NudgeVertex.kind(), OpKind::Positional);
         assert_eq!(Op::Recolor.kind(), OpKind::Chromatic);
         assert_eq!(Op::NudgeAlpha.kind(), OpKind::Chromatic);
+        assert_eq!(Op::RecolorVertex.kind(), OpKind::Gradient);
         for op in [Op::Split, Op::SwapZ, Op::AddTriangle, Op::Relocate, Op::Delete] {
             assert_eq!(op.kind(), OpKind::Structural, "{op:?} should be structural");
         }
+    }
+
+    #[test]
+    fn recolor_vertex_changes_exactly_one_vertex() {
+        // RecolorVertex is the unique `Gradient`-kind op, so we can drive `mutate`
+        // until it fires and then assert it touched exactly one vertex's RGB,
+        // leaving the other vertices (and all alphas) untouched.
+        let goal = make_solid_goal(64, [100, 150, 200]);
+        let mut rng = StdRng::seed_from_u64(7);
+        let parent = init_genome(&goal, 5, &mut rng);
+        let sigmas = StepSizes { pos: 0.0, col: 0.0, grad: 0.3 };
+        let grid = vec![0u32; GRID_CELLS];
+
+        for _ in 0..10_000 {
+            let (child, kind) = mutate(&parent, sigmas, 8, 100, &goal, &grid, &mut rng);
+            if kind != OpKind::Gradient {
+                continue;
+            }
+            assert_eq!(child.len(), parent.len(), "gradient op must not change length");
+            let rgb_changed = (0..parent.len())
+                .filter(|&i| child[i].color[..3] != parent[i].color[..3])
+                .count();
+            assert_eq!(rgb_changed, 1, "exactly one vertex's RGB should change");
+            assert!(
+                (0..parent.len()).all(|i| child[i].color[3] == parent[i].color[3]),
+                "alpha must be untouched by a gradient recolour"
+            );
+            return;
+        }
+        panic!("RecolorVertex never selected in 10000 draws");
     }
 
     #[test]
