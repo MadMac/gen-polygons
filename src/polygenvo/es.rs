@@ -94,6 +94,17 @@ pub(crate) struct EsResult {
     pub(crate) steps_run: u64,
 }
 
+/// A live observer of the search, called once per step. Lets a viewer (the
+/// `--show-window` live renderer) watch the current best without `es` depending
+/// on winit/wgpu surfaces. Returning `false` requests a graceful stop (e.g. the
+/// window was closed), handled the same way as the `stop_flag`.
+pub(crate) trait StepObserver {
+    /// `best` is the current-best genome; `improved` is true when a new best was
+    /// accepted this step (the viewer re-renders only then). Return `false` to
+    /// ask the loop to stop at this step boundary.
+    fn on_step(&mut self, best: &[Vertex], improved: bool) -> bool;
+}
+
 /// Per-type self-adapted step sizes plus the 1/5 success rule that drives them.
 /// Owns the current σ pair and the rolling beat-the-parent tallies. The single
 /// `reset_window` is the one place those tallies are cleared — promotion and the
@@ -275,6 +286,7 @@ pub(crate) fn run_es(
     queue: Arc<wgpu::Queue>,
     goal: GoalImage,
     cfg: EsConfig,
+    mut observer: Option<&mut dyn StepObserver>,
 ) -> EsResult {
     let pyramid = build_pyramid(&device, &queue, &goal);
     let full_res = pyramid.len() - 1; // index of full-resolution level (for snapshots)
@@ -319,6 +331,10 @@ pub(crate) fn run_es(
     // Seed the run folder with the initial state at full resolution.
     if let Some(dir) = &snapshot_dir {
         pyramid[full_res].snapshot(&current, &dir.join("image0.png"));
+    }
+    // Show the initial genome in the live window (if any) before stepping.
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_step(&current, true);
     }
 
     while step < cfg.max_steps {
@@ -384,6 +400,16 @@ pub(crate) fn run_es(
             && improvements_total.is_multiple_of(snap_every)
         {
             pyramid[full_res].snapshot(&current, &dir.join(format!("image{step}.png")));
+        }
+
+        // Update the live window (if any). Pumps window events every step and
+        // re-renders the best on improvement; a `false` return (window closed)
+        // requests a graceful stop via the same path as `stop_flag`.
+        if let Some(obs) = observer.as_deref_mut()
+            && !obs.on_step(&current, accepted)
+        {
+            println!("Window closed — halting at step {step}.");
+            break;
         }
 
         // Periodic progress log (rate-limited so output stays readable).
@@ -600,6 +626,7 @@ mod tests {
                 snapshot_every: None,
                 stop_flag: None,
             },
+            None,
         );
         assert!(
             result.steps_run > 0,

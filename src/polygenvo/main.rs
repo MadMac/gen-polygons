@@ -9,6 +9,7 @@ mod genome;
 mod goal;
 mod gpu;
 mod variation;
+mod window;
 #[cfg(test)]
 mod test_support;
 
@@ -25,8 +26,22 @@ fn main() {
     // process being hard-killed mid-step).
     let infinite = std::env::args().any(|a| a == "--infinite");
 
+    // `--show-window`: open a live window that renders the current best
+    // candidate as the run progresses. Closing the window stops the run
+    // gracefully (the same final-snapshot/summary path as Ctrl-C).
+    let show_window = std::env::args().any(|a| a == "--show-window");
+
     let goal = goal::load_goal_image("goal.png");
-    let (device, queue) = block_on(gpu::init_wgpu());
+
+    // In windowed mode the device must be compatible with the window surface, so
+    // `window::init_window` brings up both the window and the device together;
+    // the headless path keeps using `gpu::init_wgpu`. Either way the ES and the
+    // viewer share one device/queue.
+    let mut window_init = show_window.then(window::init_window);
+    let (device, queue) = match &window_init {
+        Some(w) => (w.device.clone(), w.queue.clone()),
+        None => block_on(gpu::init_wgpu()),
+    };
 
     let mut cfg = es::EsConfig::production();
     if infinite {
@@ -41,7 +56,10 @@ fn main() {
         println!("Running in --infinite mode; press Ctrl-C to stop.");
     }
 
-    let result = es::run_es(device, queue, goal, cfg);
+    let observer = window_init
+        .as_mut()
+        .map(|w| &mut w.observer as &mut dyn es::StepObserver);
+    let result = es::run_es(device, queue, goal, cfg, observer);
     println!(
         "Done. Initial fitness: {}, final fitness: {}, steps: {}",
         result.initial_fitness, result.final_fitness, result.steps_run
