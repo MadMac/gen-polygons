@@ -264,6 +264,12 @@ fn log_phase(label: &str, phase: &Phase, level_size: u32, sigmas: StepSizes, fit
     );
 }
 
+/// A `YYYY-MM-DD_HH-MM-SS` stamp in the user's local timezone for naming this
+/// run's snapshot folder.
+fn run_timestamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()
+}
+
 pub(crate) fn run_es(
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -300,11 +306,19 @@ pub(crate) fn run_es(
     let started = Instant::now();
     let mut last_log = Instant::now();
 
-    // Trigger a snapshot of the initial state at full resolution so the
-    // triangles/ directory has something to compare against.
-    if cfg.snapshot_every.is_some() {
-        let _ = std::fs::create_dir_all("triangles");
-        pyramid[full_res].snapshot(&current, Path::new("triangles/image0.png"));
+    // On startup, give this run its own timestamped subfolder under triangles/
+    // so successive runs don't overwrite each other's frames. Only created when
+    // snapshots are enabled (production); the smoke test passes `None`.
+    let snapshot_dir = cfg.snapshot_every.map(|_| {
+        let dir = Path::new("triangles").join(run_timestamp());
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("failed to create snapshot dir {}: {e}", dir.display()));
+        println!("Saving snapshots to {}/", dir.display());
+        dir
+    });
+    // Seed the run folder with the initial state at full resolution.
+    if let Some(dir) = &snapshot_dir {
+        pyramid[full_res].snapshot(&current, &dir.join("image0.png"));
     }
 
     while step < cfg.max_steps {
@@ -364,13 +378,12 @@ pub(crate) fn run_es(
         schedule.record(accepted);
 
         // Snapshot occasionally on improvement.
-        if let Some(snap_every) = cfg.snapshot_every
+        if let (Some(snap_every), Some(dir)) = (cfg.snapshot_every, &snapshot_dir)
             && accepted
             && improvements_total > 0
             && improvements_total.is_multiple_of(snap_every)
         {
-            let path_buf = format!("triangles/image{}.png", step);
-            pyramid[full_res].snapshot(&current, Path::new(&path_buf));
+            pyramid[full_res].snapshot(&current, &dir.join(format!("image{step}.png")));
         }
 
         // Periodic progress log (rate-limited so output stays readable).
@@ -410,9 +423,9 @@ pub(crate) fn run_es(
                     sigma.sigmas,
                     current_fitness,
                 );
-                if cfg.snapshot_every.is_some() {
-                    let path_buf = format!("triangles/image{}_phase{}.png", step, schedule.idx);
-                    pyramid[full_res].snapshot(&current, Path::new(&path_buf));
+                if let Some(dir) = &snapshot_dir {
+                    pyramid[full_res]
+                        .snapshot(&current, &dir.join(format!("image{}_phase{}.png", step, schedule.idx)));
                 }
             } else {
                 // No further phases: kick σ back to this phase's initial sizes so
@@ -436,8 +449,8 @@ pub(crate) fn run_es(
         improvements_total,
         current_fitness
     );
-    if cfg.snapshot_every.is_some() {
-        pyramid[full_res].snapshot(&current, Path::new("triangles/final.png"));
+    if let Some(dir) = &snapshot_dir {
+        pyramid[full_res].snapshot(&current, &dir.join("final.png"));
     }
 
     EsResult {

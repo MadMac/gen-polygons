@@ -16,7 +16,7 @@ Experimental playground for `wgpu`, shaders, and genetic algorithms. The goal is
 
 Runtime requirements for `polygenvo`:
 - `goal.png` must exist in the working directory (square RGBA PNG; `texture_size` is taken from its width).
-- The `triangles/` directory must exist — the binary writes `triangles/imageN.png` snapshots and will panic on `save()` if the directory is missing. It is gitignored.
+- Snapshots go to a fresh per-run subfolder `triangles/<local-timestamp>/` (e.g. `triangles/2026-06-02_12-56-43/`) that `run_es` creates on startup via `create_dir_all` (so `triangles/` need not pre-exist). `run_timestamp()` in `es.rs` names it in the user's local timezone via `chrono::Local::now()`. Frames are `imageN.png`/`final.png` inside it. `triangles/` is gitignored.
 
 ## Binaries
 
@@ -50,7 +50,7 @@ WGSL syntax is **current (post-1.0)**: `@location(0)`, `@vertex`/`@fragment`/`@c
 
 ## Dependency versions
 
-`Cargo.toml` is on a current ecosystem snapshot: `wgpu = "29"`, `image = "0.25"`, `env_logger = "0.11"`, `rand = "0.10"`, `bytemuck = "1"`, `futures = "0.3"`, `log = "0.4"`, `ctrlc = "3"` (graceful Ctrl-C for `--infinite`). Rust edition is `"2024"`.
+`Cargo.toml` is on a current ecosystem snapshot: `wgpu = "29"`, `image = "0.25"`, `env_logger = "0.11"`, `rand = "0.10"`, `bytemuck = "1"`, `futures = "0.3"`, `log = "0.4"`, `ctrlc = "3"` (graceful Ctrl-C for `--infinite`), `chrono = "0.4"` (`default-features = false, features = ["clock"]`, for local-timezone snapshot-folder timestamps). Rust edition is `"2024"`.
 
 `rand 0.10` notes for editing: use `rand::rng()` (not `thread_rng()`) and `rng.random_range(a..b)` (not `gen_range`). The `gen` keyword is reserved in edition 2024; if a method name collides it must be escaped as `r#gen`.
 
