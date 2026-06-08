@@ -75,8 +75,8 @@ fn barycentric(p: (f64, f64), v0: (f64, f64), v1: (f64, f64), v2: (f64, f64)) ->
     (l0, l1, 1.0 - l0 - l1)
 }
 
-/// Soft-composite the scene over black and return the linear-space premultiplied
-/// RGB at pixel (px,py). `tau` is the coverage temperature.
+/// Soft-composite the scene over black and return the composited linear RGB
+/// (straight-alpha OVER) at pixel (px,py). `tau` is the coverage temperature.
 fn forward_pixel_rgb(scene: &[ParamTri], px: u32, py: u32, w: u32, h: u32, tau: f64) -> [f64; 3] {
     let p = pixel_to_clip(px, py, w, h);
     let mut c = [0.0f64; 3]; // composited linear RGB over black
@@ -174,7 +174,7 @@ mod tests {
             [ 0.0,  0.8, 0.9, 0.1, 0.1, 1.0],
         ];
         let centre = forward_pixel_rgb(&[tri], 8, 8, w, h, 0.01);
-        assert!(centre[0] > 0.2, "centre should be reddish, got {centre:?}");
+        assert!(centre[0] > 0.5, "centre should be reddish, got {centre:?}");
         let corner = forward_pixel_rgb(&[tri], 0, 0, w, h, 0.01);
         assert!(corner.iter().all(|&c| c < 0.05), "corner outside -> black, got {corner:?}");
     }
