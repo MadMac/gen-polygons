@@ -12,6 +12,8 @@ mod variation;
 mod window;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod softras_ref;
 
 use futures::executor::block_on;
 use std::sync::atomic::{AtomicBool, Ordering};
