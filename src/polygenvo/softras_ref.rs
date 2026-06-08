@@ -4,7 +4,7 @@
 //! (`gradient.rs`/`softraster.wgsl`). Mirrors the hard renderer's pixel/clip
 //! mapping, color space, and OVER composite so "GPU == this" is a meaningful bar.
 
-/// Pixel-center clip coords for pixel (px, py) in an W×H image. Row 0 = top;
+/// Pixel-center clip coords for pixel (px, py) in a W×H image. Row 0 = top;
 /// clip space is y-up to match shader.wgsl.
 pub(crate) fn pixel_to_clip(px: u32, py: u32, w: u32, h: u32) -> (f64, f64) {
     let cx = (px as f64 + 0.5) / w as f64 * 2.0 - 1.0;
@@ -34,6 +34,7 @@ pub(crate) fn tri_signed_dist(p: (f64, f64), v: &[(f64, f64); 3]) -> f64 {
     d0.min(d1).min(d2)
 }
 
+/// Soft coverage approximation σ(d/τ) — approaches a hard step function as τ → 0.
 pub(crate) fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -61,10 +62,12 @@ mod tests {
 
     #[test]
     fn pixel_to_clip_corners() {
-        // Top-left pixel maps near (-1, +1); bottom-right near (+1, -1).
+        // Pixel (0,0) center → (-0.75, 0.75); pixel (3,3) center → (0.75, -0.75).
         let (cx, cy) = pixel_to_clip(0, 0, 4, 4);
-        assert!(cx < 0.0 && cy > 0.0, "top-left -> (-,+), got ({cx},{cy})");
+        assert!((cx - (-0.75)).abs() < 1e-12 && (cy - 0.75).abs() < 1e-12,
+                "top-left pixel center (-0.75, 0.75), got ({cx},{cy})");
         let (cx, cy) = pixel_to_clip(3, 3, 4, 4);
-        assert!(cx > 0.0 && cy < 0.0, "bottom-right -> (+,-), got ({cx},{cy})");
+        assert!((cx - 0.75).abs() < 1e-12 && (cy - (-0.75)).abs() < 1e-12,
+                "bottom-right pixel center (0.75, -0.75), got ({cx},{cy})");
     }
 }
