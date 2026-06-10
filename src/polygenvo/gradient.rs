@@ -498,6 +498,120 @@ pub(crate) fn gpu_forward_lab(
     pixels
 }
 
+/// Run the `softraster_tiled.wgsl` forward pass on the GPU (16×16 workgroup-per-tile)
+/// and return per-pixel Lab as `Vec<[f32; 4]>` (L, a, b, 0), row-major. Test-only:
+/// exists solely to prove GPU tiled forward == CPU oracle within 1e-2 Lab.
+#[cfg(test)]
+pub(crate) fn gpu_forward_tiled_lab(
+    device: &std::sync::Arc<wgpu::Device>,
+    queue: &std::sync::Arc<wgpu::Queue>,
+    scene: &[crate::softras_ref::ParamTri],
+    w: u32,
+    h: u32,
+    tau: f32,
+) -> Vec<[f32; 4]> {
+    use wgpu::util::DeviceExt;
+
+    let num_tris = scene.len() as u32;
+    let flat = flatten_scene(scene);
+
+    // params uniform
+    let params = SoftRasterParams { width: w, height: h, num_tris, tau };
+    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("TiledFwd Params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    // tri_params storage (read)
+    let tri_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("TiledFwd TriParams"),
+        contents: bytemuck::cast_slice(&flat),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    // state storage: vec4<f32> per pixel = (c_full.rgb, T_final)
+    let state_size = (w * h * 16) as u64;
+    let state_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("TiledFwd State"),
+        size: state_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("TiledFwd Readback"),
+        size: state_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    // pipeline from softraster_tiled.wgsl, entry "forward"
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("TiledFwd Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("softraster_tiled.wgsl").into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("TiledFwd Pipeline"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("forward"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+
+    let bgl = pipeline.get_bind_group_layout(0);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("TiledFwd Bind Group"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: state_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("TiledFwd Encoder"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("TiledFwd Pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(w.div_ceil(16), h.div_ceil(16), 1);
+    }
+    encoder.copy_buffer_to_buffer(&state_buf, 0, &readback_buf, 0, state_size);
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // read back
+    let slice = readback_buf.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| { sender.send(result).ok(); });
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    receiver.recv().unwrap().unwrap();
+
+    // Convert each pixel's (lin_rgb, _) to Lab via softras_ref::lin_rgb_to_lab.
+    let pixels: Vec<[f32; 4]> = {
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+        floats
+            .chunks_exact(4)
+            .map(|ch| {
+                let lab = crate::softras_ref::lin_rgb_to_lab(
+                    ch[0] as f64,
+                    ch[1] as f64,
+                    ch[2] as f64,
+                );
+                [lab[0] as f32, lab[1] as f32, lab[2] as f32, 0.0]
+            })
+            .collect()
+    };
+    readback_buf.unmap();
+    pixels
+}
+
 /// Run the `softraster.wgsl` backward pass on the GPU and return the flat
 /// per-param gradient (len num_tris*18, layout t*18 + k*6 + c). Test-only: the
 /// production polish path feeds the grad buffer straight into Adam on-device;
@@ -613,6 +727,27 @@ pub(crate) fn gpu_grad(
 mod tests {
     use crate::softras_ref::{forward_pixel_lab, ParamTri};
     use crate::test_support::init_test_wgpu;
+
+    #[test]
+    fn gpu_tiled_forward_matches_cpu_reference() {
+        use crate::softras_ref::{forward_pixel_lab, ParamTri};
+        use crate::test_support::init_test_wgpu;
+        let w = 40u32; let h = 40u32; let tau = 0.15f64; // >16px so triangles span tiles
+        let scene: Vec<ParamTri> = vec![
+            [[-0.7, -0.7, 0.8, 0.2, 0.2, 0.8], [0.7, -0.6, 0.2, 0.8, 0.2, 0.8], [0.0, 0.7, 0.2, 0.2, 0.8, 0.8]],
+            [[-0.2, -0.2, 0.9, 0.9, 0.1, 0.6], [0.6, -0.1, 0.1, 0.9, 0.9, 0.6], [0.1, 0.5, 0.9, 0.1, 0.9, 0.6]],
+        ];
+        let (device, queue) = init_test_wgpu();
+        let gpu = super::gpu_forward_tiled_lab(&device, &queue, &scene, w, h, tau as f32);
+        let mut maxdiff = 0.0f64;
+        for py in 0..h { for px in 0..w {
+            let cpu = forward_pixel_lab(&scene, px, py, w, h, tau);
+            let g = gpu[(py * w + px) as usize];
+            for ch in 0..3 { maxdiff = maxdiff.max((cpu[ch] - g[ch] as f64).abs()); }
+        }}
+        println!("tiled forward GPU vs CPU max Lab diff: {maxdiff}");
+        assert!(maxdiff < 1e-2, "tiled forward Lab vs CPU max diff {maxdiff} exceeds 1e-2");
+    }
 
     #[test]
     fn gpu_forward_matches_cpu_reference() {
