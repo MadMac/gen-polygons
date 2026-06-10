@@ -315,7 +315,8 @@ pub(crate) fn grad_loss(scene: &[ParamTri], goal_lab: &[[f64; 3]], w: u32, h: u3
                 let v = [(tri[0][0], tri[0][1]), (tri[1][0], tri[1][1]), (tri[2][0], tri[2][1])];
                 let d = tri_signed_dist(p, &v);
                 let cov = sigmoid(d / tau);
-                let (l, _dl) = barycentric_with_grad(p, v[0], v[1], v[2]);
+                let (l0, l1, l2) = barycentric(p, v[0], v[1], v[2]);
+                let l = [l0, l1, l2];
                 let mut rgb = [0.0f64; 3];
                 let mut a = 0.0f64;
                 for k in 0..3 {
@@ -454,13 +455,11 @@ pub(crate) fn grad_loss(scene: &[ParamTri], goal_lab: &[[f64; 3]], w: u32, h: u3
                     dl_dl[k] += dl_da * tri[k][5];
                 }
                 // dl[k][j]: j in 0..6 = (v0x,v0y,v1x,v1y,v2x,v2y).
-                for (j, gd) in (0..6).map(|j| {
-                    let g: f64 = (0..3).map(|k| dl_dl[k] * dl[k][j]).sum();
-                    (j, g)
-                }) {
-                    let vert = j / 2; // 0,1,2
-                    let comp = j % 2; // 0 = x, 1 = y
-                    grad[t][vert][comp] += gd;
+                for vert in 0..3 {
+                    for comp in 0..2 {
+                        let g: f64 = (0..3).map(|k| dl_dl[k] * dl[k][vert * 2 + comp]).sum();
+                        grad[t][vert][comp] += g;
+                    }
                 }
             }
         }
