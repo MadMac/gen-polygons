@@ -23,7 +23,6 @@ impl Default for PolishCfg {
 
 /// Uniform params for the softraster forward pass. `#[repr(C)]` + Pod so
 /// bytemuck can cast it straight to the 16-byte uniform buffer the shader reads.
-#[cfg(test)]
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SoftRasterParams {
@@ -31,6 +30,317 @@ struct SoftRasterParams {
     height: u32,
     num_tris: u32,
     tau: f32,
+}
+
+/// Uniform params for the `adam.wgsl` update pass. Matches the WGSL `AdamParams`
+/// struct field-for-field (16 bytes header + two u32 pads → 32 bytes total).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AdamUniform {
+    lr: f32,
+    b1: f32,
+    b2: f32,
+    eps: f32,
+    step_t: u32,
+    num_params: u32,
+    pad0: u32,
+    pad1: u32,
+}
+
+/// Cached pipelines + buffers for the on-device gradient polish. Built once per
+/// goal; `polish` then only writes the genome + uniforms and dispatches. The
+/// `params_buf` doubles as backward's `tri_params` and Adam's `params`; the
+/// `grad_buf` is written (atomic f32-via-u32) by backward and re-read as plain
+/// f32 by Adam.
+pub(crate) struct PolishState {
+    device: std::sync::Arc<wgpu::Device>,
+    queue: std::sync::Arc<wgpu::Queue>,
+    width: u32,
+    height: u32,
+    params_buf: wgpu::Buffer,
+    grad_buf: wgpu::Buffer,
+    adam_m_buf: wgpu::Buffer,
+    adam_v_buf: wgpu::Buffer,
+    sr_params_buf: wgpu::Buffer,
+    adam_params_buf: wgpu::Buffer,
+    backward_pipeline: wgpu::ComputePipeline,
+    adam_pipeline: wgpu::ComputePipeline,
+    backward_bind_group: wgpu::BindGroup,
+    adam_bind_group: wgpu::BindGroup,
+    readback_buf: wgpu::Buffer,
+}
+
+#[allow(dead_code)] // wired into the ES loop in Task 9
+impl PolishState {
+    /// Build the pipelines + buffers, sized to the maximum genome
+    /// (`MAX_VERTICES * 6` scalar params). The goal-Lab storage buffer is filled
+    /// once from `FitnessCalc::goal_to_lab`.
+    pub(crate) fn new(calc: &crate::fitness::FitnessCalc, goal: &crate::goal::GoalImage) -> Self {
+        use wgpu::util::DeviceExt;
+        let device = calc.device().clone();
+        let queue = calc.queue().clone();
+        let size = calc.texture_size();
+        let width = size;
+        let height = size;
+
+        let max_params = (crate::genome::MAX_VERTICES * 6) as u64;
+        let param_bytes = max_params * 4;
+
+        // Goal Lab as [L, a, b, 0] per pixel — exactly backward's goal_lab layout.
+        let goal_lab = crate::fitness::goal_to_lab(goal);
+        let goal_lab_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Polish GoalLab"),
+            contents: bytemuck::cast_slice(&goal_lab),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Polish Params"),
+            size: param_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Polish Grad"),
+            size: param_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let adam_m_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Polish AdamM"),
+            size: param_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let adam_v_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Polish AdamV"),
+            size: param_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sr_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Polish SoftRasterParams"),
+            size: std::mem::size_of::<SoftRasterParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let adam_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Polish AdamUniform"),
+            size: std::mem::size_of::<AdamUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Polish Readback"),
+            size: param_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let sr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Polish SoftRaster Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("softraster.wgsl").into()),
+        });
+        let adam_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Polish Adam Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("adam.wgsl").into()),
+        });
+
+        let backward_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Polish Backward Pipeline"),
+            layout: None,
+            module: &sr_shader,
+            entry_point: Some("backward"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let adam_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Polish Adam Pipeline"),
+            layout: None,
+            module: &adam_shader,
+            entry_point: Some("update"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        // backward references bindings 0,1,3,4 — the auto layout includes only those.
+        let backward_bgl = backward_pipeline.get_bind_group_layout(0);
+        let backward_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Polish Backward Bind Group"),
+            layout: &backward_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sr_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: goal_lab_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: grad_buf.as_entire_binding() },
+            ],
+        });
+
+        let adam_bgl = adam_pipeline.get_bind_group_layout(0);
+        let adam_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Polish Adam Bind Group"),
+            layout: &adam_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: adam_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: grad_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: adam_m_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: adam_v_buf.as_entire_binding() },
+            ],
+        });
+
+        Self {
+            device,
+            queue,
+            width,
+            height,
+            params_buf,
+            grad_buf,
+            adam_m_buf,
+            adam_v_buf,
+            sr_params_buf,
+            adam_params_buf,
+            backward_pipeline,
+            adam_pipeline,
+            backward_bind_group,
+            adam_bind_group,
+            readback_buf,
+        }
+    }
+
+    /// Run `cfg.steps_n` backward+Adam steps fully on-device starting from
+    /// `genome`, then keep the result only if the hard ΔE2000 renderer
+    /// (`calc.fitness_of`) confirms it beats `parent_fitness`. On accept, mutates
+    /// `genome` and returns `Some(new_fitness)`; otherwise leaves `genome`
+    /// untouched and returns `None`.
+    pub(crate) fn polish(
+        &mut self,
+        genome: &mut Vec<crate::genome::Vertex>,
+        parent_fitness: usize,
+        calc: &crate::fitness::FitnessCalc,
+        cfg: &PolishCfg,
+    ) -> Option<usize> {
+        let n_verts = genome.len();
+        if n_verts == 0 {
+            return None;
+        }
+        let num_tris = (n_verts / 3) as u32;
+        let num_params = (n_verts * 6) as u32;
+
+        // Flatten genome → [pos.x, pos.y, r, g, b, a] per vertex; save z for rebuild.
+        let mut flat: Vec<f32> = Vec::with_capacity(n_verts * 6);
+        let mut zs: Vec<f32> = Vec::with_capacity(n_verts);
+        for vtx in genome.iter() {
+            flat.push(vtx.position[0]);
+            flat.push(vtx.position[1]);
+            flat.push(vtx.color[0]);
+            flat.push(vtx.color[1]);
+            flat.push(vtx.color[2]);
+            flat.push(vtx.color[3]);
+            zs.push(vtx.position[2]);
+        }
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&flat));
+
+        // Zero Adam moments for this run.
+        {
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Polish Moment Clear"),
+            });
+            enc.clear_buffer(&self.adam_m_buf, 0, None);
+            enc.clear_buffer(&self.adam_v_buf, 0, None);
+            self.queue.submit(std::iter::once(enc.finish()));
+        }
+
+        for s in 0..cfg.steps_n {
+            let frac = if cfg.steps_n > 1 {
+                s as f32 / (cfg.steps_n - 1) as f32
+            } else {
+                0.0
+            };
+            let tau = cfg.tau_start * (cfg.tau_end / cfg.tau_start).powf(frac);
+            let sr = SoftRasterParams { width: self.width, height: self.height, num_tris, tau };
+            self.queue.write_buffer(&self.sr_params_buf, 0, bytemuck::bytes_of(&sr));
+            let ap = AdamUniform {
+                lr: cfg.lr,
+                b1: 0.9,
+                b2: 0.999,
+                eps: 1e-8,
+                step_t: s + 1,
+                num_params,
+                pad0: 0,
+                pad1: 0,
+            };
+            self.queue.write_buffer(&self.adam_params_buf, 0, bytemuck::bytes_of(&ap));
+
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Polish Step Encoder"),
+            });
+            enc.clear_buffer(&self.grad_buf, 0, None);
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Polish Backward Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.backward_pipeline);
+                pass.set_bind_group(0, &self.backward_bind_group, &[]);
+                pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+            }
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Polish Adam Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.adam_pipeline);
+                pass.set_bind_group(0, &self.adam_bind_group, &[]);
+                pass.dispatch_workgroups(num_params.div_ceil(64), 1, 1);
+            }
+            self.queue.submit(std::iter::once(enc.finish()));
+        }
+
+        // Read back the optimized params.
+        let read_bytes = (num_params * 4) as u64;
+        {
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Polish Readback Encoder"),
+            });
+            enc.copy_buffer_to_buffer(&self.params_buf, 0, &self.readback_buf, 0, read_bytes);
+            self.queue.submit(std::iter::once(enc.finish()));
+        }
+        let slice = self.readback_buf.slice(0..read_bytes);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
+        let out: Vec<f32> = {
+            let data = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&data);
+            floats[..num_params as usize].to_vec()
+        };
+        self.readback_buf.unmap();
+
+        // Rebuild candidate genome from read-back params + saved z.
+        let candidate: Vec<crate::genome::Vertex> = (0..n_verts)
+            .map(|i| {
+                let b = i * 6;
+                crate::genome::Vertex {
+                    position: [out[b], out[b + 1], zs[i]],
+                    color: [out[b + 2], out[b + 3], out[b + 4], out[b + 5]],
+                }
+            })
+            .collect();
+
+        let cand_fit = calc.fitness_of(&candidate);
+        if cand_fit > parent_fitness {
+            *genome = candidate;
+            Some(cand_fit)
+        } else {
+            None
+        }
+    }
 }
 
 /// Flatten a scene (slice of `ParamTri`) into a `Vec<f32>` in the layout the
@@ -361,5 +671,53 @@ mod tests {
         }
         println!("GPU grad vs CPU max rel err: {maxrel}");
         assert!(maxrel < 2e-2, "GPU grad vs CPU max rel err {maxrel} exceeds 2e-2");
+    }
+
+    #[test]
+    fn gpu_polish_improves_hard_de2000() {
+        use crate::fitness::FitnessCalc;
+        use crate::test_support::{init_test_wgpu, make_solid_goal};
+        let size = 64u32;
+        let goal = make_solid_goal(size, [50, 150, 230]);
+        let (device, queue) = init_test_wgpu();
+        let calc = FitnessCalc::new_for_test(device, queue, &goal, 1);
+        let mut state = super::PolishState::new(&calc, &goal);
+        // stuck small corner triangle, ~goal colour
+        let mut genome = vec![
+            crate::genome::Vertex { position: [-0.9, -0.9, 0.0], color: [0.196, 0.588, 0.902, 1.0] },
+            crate::genome::Vertex { position: [-0.6, -0.9, 0.0], color: [0.196, 0.588, 0.902, 1.0] },
+            crate::genome::Vertex { position: [-0.9, -0.6, 0.0], color: [0.196, 0.588, 0.902, 1.0] },
+        ];
+        let parent = calc.fitness_of(&genome);
+        let before = genome.clone();
+        let cfg = super::PolishCfg { enabled: true, every_k: 1, steps_n: 80, lr: 0.05, tau_start: 0.3, tau_end: 0.02 };
+        let kept = state.polish(&mut genome, parent, &calc, &cfg);
+        let newfit = kept.expect("polish should improve hard fitness on the stuck triangle");
+        println!("hard fitness before={parent} after={newfit}");
+        assert!(newfit > parent, "kept fitness {newfit} must beat parent {parent}");
+        assert!(genome != before, "kept polish must mutate the genome");
+    }
+
+    #[test]
+    fn polish_gate_rejects_noop_and_leaves_genome_unchanged() {
+        use crate::fitness::FitnessCalc;
+        use crate::test_support::{init_test_wgpu, make_solid_goal};
+        let size = 64u32;
+        let goal = make_solid_goal(size, [50, 150, 230]);
+        let (device, queue) = init_test_wgpu();
+        let calc = FitnessCalc::new_for_test(device, queue, &goal, 1);
+        let mut state = super::PolishState::new(&calc, &goal);
+        let mut genome = vec![
+            crate::genome::Vertex { position: [-0.9, -0.9, 0.0], color: [0.196, 0.588, 0.902, 1.0] },
+            crate::genome::Vertex { position: [-0.6, -0.9, 0.0], color: [0.196, 0.588, 0.902, 1.0] },
+            crate::genome::Vertex { position: [-0.9, -0.6, 0.0], color: [0.196, 0.588, 0.902, 1.0] },
+        ];
+        let parent = calc.fitness_of(&genome);
+        let before = genome.clone();
+        // steps_n = 0: no optimization happens, candidate == parent, gate must reject.
+        let cfg = super::PolishCfg { enabled: true, every_k: 1, steps_n: 0, lr: 0.05, tau_start: 0.3, tau_end: 0.02 };
+        let kept = state.polish(&mut genome, parent, &calc, &cfg);
+        assert!(kept.is_none(), "no-op polish must be rejected by the gate");
+        assert_eq!(genome, before, "rejected polish must leave the genome byte-identical");
     }
 }

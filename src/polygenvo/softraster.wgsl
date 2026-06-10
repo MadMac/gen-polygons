@@ -7,7 +7,7 @@ struct Params {
     height: u32,
     num_tris: u32,
     tau: f32,
-};
+}
 @group(0) @binding(0) var<uniform> params: Params;
 
 // Triangle params, tightly packed f32: triangle t, vertex k, component c lives
