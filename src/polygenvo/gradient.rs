@@ -21,6 +21,12 @@ impl Default for PolishCfg {
     }
 }
 
+// Adam optimizer hyperparameters (standard defaults; not exposed in PolishCfg
+// because they're rarely worth tuning — lr/tau/steps in PolishCfg are the knobs).
+const ADAM_B1: f32 = 0.9;
+const ADAM_B2: f32 = 0.999;
+const ADAM_EPS: f32 = 1e-8;
+
 /// Uniform params for the softraster forward pass. `#[repr(C)]` + Pod so
 /// bytemuck can cast it straight to the 16-byte uniform buffer the shader reads.
 #[repr(C)]
@@ -63,6 +69,7 @@ pub(crate) struct PolishState {
     adam_v_buf: wgpu::Buffer,
     sr_params_buf: wgpu::Buffer,
     adam_params_buf: wgpu::Buffer,
+    _goal_lab_buf: wgpu::Buffer,
     backward_pipeline: wgpu::ComputePipeline,
     adam_pipeline: wgpu::ComputePipeline,
     backward_bind_group: wgpu::BindGroup,
@@ -202,6 +209,7 @@ impl PolishState {
             adam_v_buf,
             sr_params_buf,
             adam_params_buf,
+            _goal_lab_buf: goal_lab_buf,
             backward_pipeline,
             adam_pipeline,
             backward_bind_group,
@@ -264,9 +272,9 @@ impl PolishState {
             self.queue.write_buffer(&self.sr_params_buf, 0, bytemuck::bytes_of(&sr));
             let ap = AdamUniform {
                 lr: cfg.lr,
-                b1: 0.9,
-                b2: 0.999,
-                eps: 1e-8,
+                b1: ADAM_B1,
+                b2: ADAM_B2,
+                eps: ADAM_EPS,
                 step_t: s + 1,
                 num_params,
                 pad0: 0,
@@ -296,6 +304,9 @@ impl PolishState {
                 pass.set_bind_group(0, &self.adam_bind_group, &[]);
                 pass.dispatch_workgroups(num_params.div_ceil(64), 1, 1);
             }
+            // Per-step submit: the sr-params/adam uniforms change each step, and write_buffer
+            // can't be recorded into an encoder; wgpu orders write_buffer before the next
+            // submit, so each step sees its own uniforms. (Batching is the deferred tiled kernel.)
             self.queue.submit(std::iter::once(enc.finish()));
         }
 
