@@ -327,10 +327,10 @@ impl StepObserver for WindowObserver {
 pub(crate) fn init_window(goal_size: u32) -> WindowInit {
     let mut event_loop = EventLoop::new().expect("failed to create event loop");
 
-    // GL backend (matching the headless path). On GLES/Wayland the instance
+    // Same backend selection as the headless path. On GLES/Wayland the instance
     // needs the platform display handle up front to be able to present.
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::GL,
+        backends: crate::gpu::preferred_backends(),
         flags: wgpu::InstanceFlags::default(),
         memory_budget_thresholds: Default::default(),
         backend_options: wgpu::BackendOptions::default(),

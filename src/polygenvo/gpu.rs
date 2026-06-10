@@ -14,7 +14,7 @@ fn backends_from_env(v: Option<&str>) -> wgpu::Backends {
     }
 }
 
-fn preferred_backends() -> wgpu::Backends {
+pub(crate) fn preferred_backends() -> wgpu::Backends {
     backends_from_env(std::env::var("POLYGENVO_BACKEND").ok().as_deref())
 }
 
