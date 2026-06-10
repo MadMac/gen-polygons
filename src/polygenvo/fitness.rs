@@ -314,6 +314,17 @@ impl FitnessCalc {
     pub(crate) fn texture_size(&self) -> u32 {
         self.inner.texture_size
     }
+
+    /// Test/inter-module constructor alias for the private `new`.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        goal: &GoalImage,
+        sample_count: u32,
+    ) -> Self {
+        Self::new(device, queue, goal, sample_count)
+    }
 }
 
 impl FitnessCalcInner {

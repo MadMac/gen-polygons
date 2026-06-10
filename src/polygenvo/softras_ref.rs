@@ -468,6 +468,34 @@ pub(crate) fn grad_loss(scene: &[ParamTri], goal_lab: &[[f64; 3]], w: u32, h: u3
     grad
 }
 
+pub(crate) struct AdamCfg { pub steps: usize, pub lr: f64, pub tau_start: f64, pub tau_end: f64 }
+
+/// Run Adam on the scene params minimizing `forward_loss`. τ anneals
+/// geometrically from tau_start to tau_end. Returns the optimized scene.
+pub(crate) fn adam_polish(mut scene: Vec<ParamTri>, goal_lab: &[[f64; 3]], w: u32, h: u32, cfg: &AdamCfg) -> Vec<ParamTri> {
+    let n = scene.len();
+    let mut m = vec![[[0.0f64; 6]; 3]; n];
+    let mut v = vec![[[0.0f64; 6]; 3]; n];
+    let (b1, b2, eps) = (0.9, 0.999, 1e-8);
+    for s in 0..cfg.steps {
+        let frac = if cfg.steps > 1 { s as f64 / (cfg.steps - 1) as f64 } else { 0.0 };
+        let tau = cfg.tau_start * (cfg.tau_end / cfg.tau_start).powf(frac);
+        let g = grad_loss(&scene, goal_lab, w, h, tau);
+        let t = (s + 1) as f64;
+        for tri in 0..n { for vert in 0..3 { for c in 0..6 {
+            let gr = g[tri][vert][c];
+            m[tri][vert][c] = b1 * m[tri][vert][c] + (1.0 - b1) * gr;
+            v[tri][vert][c] = b2 * v[tri][vert][c] + (1.0 - b2) * gr * gr;
+            let mh = m[tri][vert][c] / (1.0 - b1.powf(t));
+            let vh = v[tri][vert][c] / (1.0 - b2.powf(t));
+            scene[tri][vert][c] -= cfg.lr * mh / (vh.sqrt() + eps);
+            if c < 2 { scene[tri][vert][c] = scene[tri][vert][c].clamp(-1.0, 1.0); }
+            else { scene[tri][vert][c] = scene[tri][vert][c].clamp(0.0, 1.0); }
+        }}}
+    }
+    scene
+}
+
 #[cfg(test)]
 mod tests {
     // The finite-difference gradient check is the task spec, kept verbatim;
@@ -564,5 +592,73 @@ mod tests {
         assert!(sharp > soft, "interior coverage sharpens toward 1 as τ shrinks");
         let sharp_out = sigmoid(tri_signed_dist(outside, &v) / 0.005);
         assert!(sharp_out < 0.01, "exterior coverage -> 0 as τ shrinks");
+    }
+
+    /// ParamTri scene -> genome Vec<Vertex> (z=0). Vertex order = draw order.
+    fn scene_to_genome(scene: &[ParamTri]) -> Vec<crate::genome::Vertex> {
+        let mut g = Vec::with_capacity(scene.len() * 3);
+        for tri in scene {
+            for vrt in tri {
+                g.push(crate::genome::Vertex {
+                    position: [vrt[0] as f32, vrt[1] as f32, 0.0],
+                    color: [vrt[2] as f32, vrt[3] as f32, vrt[4] as f32, vrt[5] as f32],
+                });
+            }
+        }
+        g
+    }
+
+    /// Bake a GoalImage to row-major f64 CIELAB (mirrors fitness.rs goal_to_lab).
+    fn goal_image_to_lab_f64(goal: &crate::goal::GoalImage, w: u32, h: u32) -> Vec<[f64; 3]> {
+        let _ = (w, h); // dimensions implicit in goal.pixels iterator
+        let mut out = Vec::with_capacity((goal.pixels.width() * goal.pixels.height()) as usize);
+        for p in goal.pixels.pixels() {
+            out.push(rgb_to_lab(p[0] as f64 / 255.0, p[1] as f64 / 255.0, p[2] as f64 / 255.0));
+        }
+        out
+    }
+
+    #[test]
+    fn adam_polish_lowers_loss_on_misplaced_triangle() {
+        let w = 24; let h = 24;
+        let goal_lab: Vec<[f64;3]> = (0..w*h).map(|_| rgb_to_lab(0.2, 0.6, 0.9)).collect();
+        // Triangle with slightly wrong color near center — both position and color
+        // gradients are active, so Adam converges fast.
+        let scene: Vec<ParamTri> = vec![[
+            [-0.4, -0.4, 0.5, 0.5, 0.5, 1.0],
+            [ 0.4, -0.4, 0.5, 0.5, 0.5, 1.0],
+            [ 0.0,  0.4, 0.5, 0.5, 0.5, 1.0],
+        ]];
+        let cfg = AdamCfg { steps: 60, lr: 0.05, tau_start: 0.3, tau_end: 0.02 };
+        let before = forward_loss(&scene, &goal_lab, w, h, cfg.tau_end);
+        let after_scene = adam_polish(scene, &goal_lab, w, h, &cfg);
+        let after = forward_loss(&after_scene, &goal_lab, w, h, cfg.tau_end);
+        assert!(after < before * 0.9, "polish should cut loss >=10%: {before} -> {after}");
+    }
+
+    #[test]
+    fn milestone1_polish_improves_hard_de2000() {
+        use crate::fitness::FitnessCalc;
+        use crate::test_support::{init_test_wgpu, make_solid_goal};
+
+        let size = 64u32;
+        let goal = make_solid_goal(size, [50, 150, 230]);
+        let (device, queue) = init_test_wgpu();
+        let calc = FitnessCalc::new_for_test(device, queue, &goal, 1);
+
+        let scene: Vec<ParamTri> = vec![[
+            [-0.9, -0.9, 0.196, 0.588, 0.902, 1.0],
+            [-0.6, -0.9, 0.196, 0.588, 0.902, 1.0],
+            [-0.9, -0.6, 0.196, 0.588, 0.902, 1.0],
+        ]];
+        let goal_lab = goal_image_to_lab_f64(&goal, size, size);
+        let before = calc.fitness_of(&scene_to_genome(&scene));
+
+        let cfg = AdamCfg { steps: 80, lr: 0.05, tau_start: 0.3, tau_end: 0.02 };
+        let polished = adam_polish(scene, &goal_lab, size, size, &cfg);
+        let after = calc.fitness_of(&scene_to_genome(&polished));
+
+        println!("milestone1: hard ΔE2000 fitness before={before} after={after}");
+        assert!(after > before, "hard ΔE2000 fitness must improve: {before} -> {after}");
     }
 }
