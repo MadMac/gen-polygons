@@ -468,6 +468,9 @@ pub(crate) fn grad_loss(scene: &[ParamTri], goal_lab: &[[f64; 3]], w: u32, h: u3
     grad
 }
 
+/// Config for the CPU reference Adam polish: `steps` iterations at learning
+/// rate `lr`, with the soft-coverage temperature annealed geometrically from
+/// `tau_start` (soft, for gradient flow) to `tau_end` (sharp, near the hard edge).
 pub(crate) struct AdamCfg { pub steps: usize, pub lr: f64, pub tau_start: f64, pub tau_end: f64 }
 
 /// Run Adam on the scene params minimizing `forward_loss`. τ anneals
@@ -609,8 +612,7 @@ mod tests {
     }
 
     /// Bake a GoalImage to row-major f64 CIELAB (mirrors fitness.rs goal_to_lab).
-    fn goal_image_to_lab_f64(goal: &crate::goal::GoalImage, w: u32, h: u32) -> Vec<[f64; 3]> {
-        let _ = (w, h); // dimensions implicit in goal.pixels iterator
+    fn goal_image_to_lab_f64(goal: &crate::goal::GoalImage) -> Vec<[f64; 3]> {
         let mut out = Vec::with_capacity((goal.pixels.width() * goal.pixels.height()) as usize);
         for p in goal.pixels.pixels() {
             out.push(rgb_to_lab(p[0] as f64 / 255.0, p[1] as f64 / 255.0, p[2] as f64 / 255.0));
@@ -651,7 +653,7 @@ mod tests {
             [-0.6, -0.9, 0.196, 0.588, 0.902, 1.0],
             [-0.9, -0.6, 0.196, 0.588, 0.902, 1.0],
         ]];
-        let goal_lab = goal_image_to_lab_f64(&goal, size, size);
+        let goal_lab = goal_image_to_lab_f64(&goal);
         let before = calc.fitness_of(&scene_to_genome(&scene));
 
         let cfg = AdamCfg { steps: 80, lr: 0.05, tau_start: 0.3, tau_end: 0.02 };
