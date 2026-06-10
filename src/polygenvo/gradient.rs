@@ -4,7 +4,6 @@
 //! reuses FitnessCalc's wgpu device/queue. See
 //! docs/superpowers/specs/2026-06-08-gpu-differentiable-rasterizer-design.md.
 
-#[allow(dead_code)] // fields used in Task 8/9
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PolishCfg {
     pub(crate) enabled: bool,
@@ -77,7 +76,6 @@ pub(crate) struct PolishState {
     readback_buf: wgpu::Buffer,
 }
 
-#[allow(dead_code)] // wired into the ES loop in Task 9
 impl PolishState {
     /// Build the pipelines + buffers, sized to the maximum genome
     /// (`MAX_VERTICES * 6` scalar params). The goal-Lab storage buffer is filled

@@ -414,7 +414,9 @@ pub(crate) fn run_es(
                 && let Some(state) = polish_state.as_mut()
             {
                 let (parent_full, _) = score(&pyramid[full_res], &current);
-                if let Some(newfit) = state.polish(&mut current, parent_full, &pyramid[full_res], &cfg.polish) {
+                if let Some(newfit) = state.polish(
+                    &mut current, parent_full, &pyramid[full_res], &cfg.polish,
+                ) {
                     // Polish kept: refresh working fitness/grid at the CURRENT phase
                     // level so selection stays consistent with the level the ES scores at.
                     (current_fitness, parent_error_grid) =

@@ -315,12 +315,10 @@ impl FitnessCalc {
         self.inner.texture_size
     }
 
-    /// Shared wgpu device. Exposed for gradient.rs (Task 6+).
-    #[allow(dead_code)] // used by gradient.rs (Task 6+)
+    /// Shared wgpu device. Used by gradient.rs.
     pub(crate) fn device(&self) -> &std::sync::Arc<wgpu::Device> { &self.inner.device }
 
-    /// Shared wgpu queue. Exposed for gradient.rs (Task 6+).
-    #[allow(dead_code)] // used by gradient.rs (Task 6+)
+    /// Shared wgpu queue. Used by gradient.rs.
     pub(crate) fn queue(&self) -> &std::sync::Arc<wgpu::Queue> { &self.inner.queue }
 
     /// Test/inter-module constructor alias for the private `new`.
