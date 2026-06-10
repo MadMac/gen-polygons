@@ -71,6 +71,14 @@ backward pass in WGSL** (no framework), producing gradients for **all** triangle
 cheaply on the existing wgpu device — so the silhouette wall genuinely dissolves
 (all vertices move coherently downhill, no elitist rejection).
 
+- **Status (2026-06-10):** started on `feat/gpu-differentiable-rasterizer`. The
+  forward+backward soft rasterizer is built and validated (CPU-reference-first,
+  finite-difference verified; WGSL matches to ~5e-6), and the gated polish provably
+  lifts hard ΔE2000 on a stuck triangle. But the **brute-force** kernel is O(num_tris²)
+  per pixel + CAS-atomic-contention bound → too slow at 512², and in-loop polishes get
+  gate-rejected during active evolution. Net: mechanism proven, **no live win yet**;
+  needs the tiled/gather-per-vertex kernel + cadence tuning. See
+  `2026-06-08-gpu-differentiable-rasterizer-design.md` (Outcome).
 - **Payoff:** the real quality step-change; how modern image-triangulation is done.
 - **Cost/risk:** research-grade. The shelved branch proves the *math* works and is
   a reference for coverage/barycentric/composite/Lab; the lesson learned is that

@@ -150,3 +150,44 @@ behind the gate), not a new pipeline. Not built now; nothing here blocks it.
 - Tiled full-genome **store-and-replay** autodiff (the per-triangle-per-pixel memory
   wall; rejected).
 - `burn`/any framework or a separate wgpu device + CPU round-trip.
+
+## Outcome (implemented 2026-06-10, branch `feat/gpu-differentiable-rasterizer`)
+
+The full design was built CPU-reference-first and is **correct and validated**, but the
+brute-force kernel is **not yet a net in-loop win** — production speed/cadence work is
+deferred (as the plan anticipated). What landed and what we learned:
+
+**Validated (the mechanism works):**
+- CPU reference soft-rasterizer: forward Lab-MSE + analytic backward, **finite-difference
+  verified** (`softras_ref.rs`).
+- WGSL forward matches the CPU reference to **5.2e-5**; WGSL backward (CAS atomic-float
+  scatter) matches the FD-verified CPU gradient to **5.6e-6** (all 6 params/vertex).
+- **Milestone 1**: on a synthetic stuck-big-triangle scene, the polish lifts the real hard
+  ΔE2000 fitness **484461 → 517980** (GPU) — matching the CPU reference (517983) almost
+  exactly. The gate correctly rejects no-ops, leaving the genome byte-identical.
+- Wired behind `--gradient-polish` (default **off**); the flag-off ES path is byte-for-byte
+  unchanged (smoke test green).
+
+**Why it isn't a live win yet (A/B on a downscaled `goal.png`):**
+- **128²**: the first polish never returns within 60 s. The backward is **O(num_tris²) per
+  pixel** (it recomputes the prefix composite and suffix transmittance per triangle) AND the
+  CAS atomic-float scatter into only `num_tris*18` slots is **contention-bound** at realistic
+  pixel/triangle counts. Effectively hangs.
+- **64²**: the polish completes but at ~**120 steps/s** vs ~1300 baseline, and **every polish
+  is rejected by the ΔE2000 gate**. During active coarse-phase evolution the genome is not
+  "stuck" like the synthetic scene, so the Lab-MSE proxy's gains don't beat the hard ΔE2000
+  parent at full res → pure overhead, no quality gain.
+
+**Conclusion / next steps (a follow-up plan):**
+1. **Tiled / gather-per-vertex backward kernel** (the deferred Milestone-3): bin triangles to
+   tiles, cache per-triangle forward state to drop O(num_tris²) → O(num_tris), and replace the
+   CAS scatter with gather-per-vertex (one thread per vertex over its bbox) to eliminate atomic
+   contention. This is the prerequisite for any 512² use.
+2. **Cadence/targeting**: only polish on a genuine *full-resolution plateau* (not during coarse
+   evolution), and consider targeting the stuck/large triangles rather than all-triangle every
+   time, so polishes have headroom to beat the gate.
+3. **Proxy alignment**: the soft Lab-MSE proxy beats the ΔE2000 gate easily on grossly-wrong
+   geometry but not on near-converged genomes; revisit if (1)+(2) still under-deliver.
+
+The branch is a correct, tested foundation (35 tests green, clippy clean) that the tiled-kernel
+plan builds on; it is not yet enabled for production runs.
