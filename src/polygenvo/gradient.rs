@@ -708,6 +708,57 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_backend() {
+        use crate::fitness::FitnessCalc;
+        use crate::genome::init_genome;
+        use crate::test_support::make_solid_goal;
+        use rand::{rngs::StdRng, SeedableRng};
+        use std::time::Instant;
+
+        let (device, queue) = crate::test_support::init_test_wgpu();
+        println!("--- bench_backend (set POLYGENVO_BACKEND=gl|vulkan to compare) ---");
+
+        // Fitness scoring throughput at each resolution (the core ES per-step cost).
+        for &size in &[128u32, 256, 512] {
+            let goal = make_solid_goal(size, [40, 120, 200]);
+            let calc = FitnessCalc::new_for_test(device.clone(), queue.clone(), &goal, 1);
+            let mut rng = StdRng::seed_from_u64(1);
+            let g = init_genome(&goal, 200, &mut rng);
+            let _ = calc.fitness_of_batch(&[g.as_slice()]); // warmup
+            let iters = 50;
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = calc.fitness_of_batch(&[g.as_slice()]);
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            println!("fitness {size}² (200 tris): {ms:.3} ms/score");
+        }
+
+        // Brute-force polish cost at bounded sizes/steps (128/256 only; small genome)
+        // so this can never hang the suite even on the slow GL backend.
+        for &size in &[128u32, 256] {
+            let goal = make_solid_goal(size, [40, 120, 200]);
+            let calc = FitnessCalc::new_for_test(device.clone(), queue.clone(), &goal, 1);
+            let mut state = super::PolishState::new(&calc, &goal);
+            let mut rng = StdRng::seed_from_u64(2);
+            let mut g = init_genome(&goal, 100, &mut rng);
+            let parent = calc.fitness_of(&g);
+            let cfg = super::PolishCfg {
+                enabled: true,
+                every_k: 1,
+                steps_n: 10,
+                lr: 0.05,
+                tau_start: 0.3,
+                tau_end: 0.05,
+            };
+            let t = Instant::now();
+            let _ = state.polish(&mut g, parent, &calc, &cfg);
+            println!("polish {size}² (100 tris, 10 steps): {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    #[test]
     fn polish_gate_rejects_noop_and_leaves_genome_unchanged() {
         use crate::fitness::FitnessCalc;
         use crate::test_support::{init_test_wgpu, make_solid_goal};
