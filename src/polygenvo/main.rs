@@ -6,6 +6,7 @@
 mod es;
 mod fitness;
 mod genome;
+mod gradient;
 mod goal;
 mod gpu;
 mod variation;

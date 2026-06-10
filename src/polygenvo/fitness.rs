@@ -315,6 +315,14 @@ impl FitnessCalc {
         self.inner.texture_size
     }
 
+    /// Shared wgpu device. Exposed for gradient.rs (Task 6+).
+    #[allow(dead_code)] // used by gradient.rs (Task 6+)
+    pub(crate) fn device(&self) -> &std::sync::Arc<wgpu::Device> { &self.inner.device }
+
+    /// Shared wgpu queue. Exposed for gradient.rs (Task 6+).
+    #[allow(dead_code)] // used by gradient.rs (Task 6+)
+    pub(crate) fn queue(&self) -> &std::sync::Arc<wgpu::Queue> { &self.inner.queue }
+
     /// Test/inter-module constructor alias for the private `new`.
     #[cfg(test)]
     pub(crate) fn new_for_test(
@@ -609,7 +617,7 @@ fn xyz_to_lab(xyz: [f32; 3]) -> [f32; 3] {
 /// trailing 0 keeps the storage element 16-byte aligned for the shader's
 /// `array<vec4<f32>>`). Runs once per `FitnessCalc`; mirrors the shader's
 /// sRGB→linear→XYZ→Lab path so scores only shift in the low bits.
-fn goal_to_lab(goal: &GoalImage) -> Vec<[f32; 4]> {
+pub(crate) fn goal_to_lab(goal: &GoalImage) -> Vec<[f32; 4]> {
     goal
         .pixels
         .pixels()
