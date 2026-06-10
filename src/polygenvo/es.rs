@@ -4,6 +4,7 @@
 use crate::fitness::{build_pyramid, FitnessCalc, LAMBDA};
 use crate::genome::{init_genome, Vertex, INITIAL_TRIANGLES, MAX_TRIANGLES};
 use crate::goal::GoalImage;
+use crate::gradient::{PolishCfg, PolishState};
 use crate::variation::{mutate, OpKind, StepSizes};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,6 +85,7 @@ pub(crate) struct EsConfig {
     // `true` (a Ctrl-C handler in `main` drives it for `--infinite` runs), then
     // falls through to the normal final-snapshot/summary path.
     pub(crate) stop_flag: Option<Arc<AtomicBool>>,
+    pub(crate) polish: PolishCfg,
 }
 
 impl EsConfig {
@@ -94,6 +96,7 @@ impl EsConfig {
             lambda: LAMBDA,
             snapshot_every: Some(SNAPSHOT_EVERY_IMPROVEMENT),
             stop_flag: None,
+            polish: PolishCfg::default(),
         }
     }
 }
@@ -301,6 +304,10 @@ pub(crate) fn run_es(
     let pyramid = build_pyramid(&device, &queue, &goal);
     let full_res = pyramid.len() - 1; // index of full-resolution level (for snapshots)
 
+    // Optional gradient-polish state (built only when the flag is on). Polishes
+    // against the full-resolution evaluator — the silhouette wall lives at 512².
+    let mut polish_state = cfg.polish.enabled.then(|| PolishState::new(&pyramid[full_res], &goal));
+
     let mut rng = rand::rng();
 
     // ---- Phase 0: initialise the genome (INITIAL_TRIANGLES, capped at phase 0's ceiling) ----
@@ -398,6 +405,23 @@ pub(crate) fn run_es(
             current = candidates.swap_remove(i);
             current_fitness = best_fit;
             improvements_total += 1;
+
+            // Periodic all-triangle gradient polish of the new best, gated by the
+            // real ΔE2000 renderer (polish() keeps it only if it beats the parent
+            // at full resolution, so the (1+λ) no-regression guarantee holds).
+            if cfg.polish.every_k > 0
+                && improvements_total.is_multiple_of(cfg.polish.every_k)
+                && let Some(state) = polish_state.as_mut()
+            {
+                let (parent_full, _) = score(&pyramid[full_res], &current);
+                if let Some(newfit) = state.polish(&mut current, parent_full, &pyramid[full_res], &cfg.polish) {
+                    // Polish kept: refresh working fitness/grid at the CURRENT phase
+                    // level so selection stays consistent with the level the ES scores at.
+                    (current_fitness, parent_error_grid) =
+                        score(&pyramid[cfg.phases[schedule.idx].pyramid_level], &current);
+                    println!("  ↳ polish kept @ improvement {improvements_total}: full-res fit {parent_full} → {newfit}");
+                }
+            }
         }
         step += 1;
         sigma.end_step();
@@ -635,6 +659,7 @@ mod tests {
                 lambda: 4,
                 snapshot_every: None,
                 stop_flag: None,
+                polish: PolishCfg::default(),
             },
             None,
         );

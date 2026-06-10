@@ -48,6 +48,11 @@ fn main() {
     // gracefully (the same final-snapshot/summary path as Ctrl-C).
     let show_window = std::env::args().any(|a| a == "--show-window");
 
+    // `--gradient-polish`: every PolishCfg.every_k accepted improvements, run an
+    // on-device gradient polish of all triangle positions+colors and keep it only
+    // if the hard ΔE2000 renderer confirms it beats the parent.
+    let gradient_polish = std::env::args().any(|a| a == "--gradient-polish");
+
     // `--goal <path>`: image to approximate. Defaults to goal.png.
     let goal_path = arg_value("--goal").unwrap_or_else(|| "goal.png".to_string());
     let goal = goal::load_goal_image(&goal_path);
@@ -63,6 +68,10 @@ fn main() {
     };
 
     let mut cfg = es::EsConfig::production();
+    cfg.polish.enabled = gradient_polish;
+    if gradient_polish {
+        println!("Gradient polish enabled (every {} accepted improvements).", cfg.polish.every_k);
+    }
     if infinite {
         let stop = Arc::new(AtomicBool::new(false));
         cfg.max_steps = u64::MAX;
