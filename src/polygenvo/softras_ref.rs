@@ -56,7 +56,7 @@ fn xyz_to_lab(xyz: [f64; 3]) -> [f64; 3] {
     let fz = f(xyz[2] / 1.08883);
     [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
 }
-fn rgb_to_lab(r: f64, g: f64, b: f64) -> [f64; 3] {
+pub(crate) fn rgb_to_lab(r: f64, g: f64, b: f64) -> [f64; 3] {
     let lin = [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)];
     xyz_to_lab(linear_rgb_to_xyz(lin[0], lin[1], lin[2]))
 }

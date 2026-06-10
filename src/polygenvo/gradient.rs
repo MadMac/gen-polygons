@@ -170,6 +170,127 @@ pub(crate) fn gpu_forward_lab(
     pixels
 }
 
+/// Run the `softraster.wgsl` backward pass on the GPU and return the flat
+/// per-param gradient (len num_tris*18, layout t*18 + k*6 + c). Test-only: the
+/// production polish path feeds the grad buffer straight into Adam on-device;
+/// this reads it back solely to prove GPU == CPU reference within rel 2e-2.
+#[cfg(test)]
+pub(crate) fn gpu_grad(
+    device: &std::sync::Arc<wgpu::Device>,
+    queue: &std::sync::Arc<wgpu::Queue>,
+    scene: &[crate::softras_ref::ParamTri],
+    goal_lab: &[[f32; 4]],
+    w: u32,
+    h: u32,
+    tau: f32,
+) -> Vec<f32> {
+    use wgpu::util::DeviceExt;
+
+    let num_tris = scene.len() as u32;
+    let mut flat: Vec<f32> = Vec::with_capacity(scene.len() * 18);
+    for tri in scene {
+        for vert in tri {
+            for &comp in vert {
+                flat.push(comp as f32);
+            }
+        }
+    }
+    if flat.is_empty() {
+        flat.push(0.0);
+    }
+
+    let params = SoftRasterParams { width: w, height: h, num_tris, tau };
+    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("SoftRaster Grad Params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let tri_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("SoftRaster Grad TriParams"),
+        contents: bytemuck::cast_slice(&flat),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let goal_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("SoftRaster Grad GoalLab"),
+        contents: bytemuck::cast_slice(goal_lab),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let grad_len = (num_tris.max(1) * 18) as u64;
+    let grad_size = grad_len * 4;
+    let grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("SoftRaster Grad Accum"),
+        size: grad_size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("SoftRaster Grad Readback"),
+        size: grad_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("SoftRaster Backward Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("softraster.wgsl").into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("SoftRaster Backward Pipeline"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("backward"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+
+    // backward references bindings 0,1,3,4 — the auto layout includes only those.
+    let bind_group_layout = pipeline.get_bind_group_layout(0);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("SoftRaster Grad Bind Group"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: goal_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: grad_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("SoftRaster Grad Encoder"),
+    });
+    encoder.clear_buffer(&grad_buf, 0, None);
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("SoftRaster Backward Pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+    }
+    encoder.copy_buffer_to_buffer(&grad_buf, 0, &readback_buf, 0, grad_size);
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = readback_buf.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).ok();
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    receiver.recv().unwrap().unwrap();
+    let out: Vec<f32> = {
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+        floats.to_vec()
+    };
+    readback_buf.unmap();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use crate::softras_ref::{forward_pixel_lab, ParamTri};
@@ -206,5 +327,40 @@ mod tests {
         }
         println!("GPU forward Lab vs CPU max diff: {maxdiff}");
         assert!(maxdiff < 1e-2, "GPU forward Lab vs CPU max diff {maxdiff} exceeds 1e-2");
+    }
+
+    #[test]
+    fn gpu_backward_matches_cpu_reference() {
+        use crate::softras_ref::grad_loss;
+        let w = 12u32;
+        let h = 12u32;
+        let tau = 0.15f64;
+        let scene: Vec<ParamTri> = vec![[
+            [-0.4, -0.3, 0.7, 0.2, 0.6, 0.8],
+            [0.5, -0.4, 0.2, 0.7, 0.3, 0.8],
+            [0.1, 0.6, 0.4, 0.4, 0.9, 0.8],
+        ]];
+        let grey = crate::softras_ref::rgb_to_lab(0.5, 0.5, 0.5);
+        let goal_f64: Vec<[f64; 3]> = (0..w * h).map(|_| grey).collect();
+        let goal_f32: Vec<[f32; 4]> = goal_f64
+            .iter()
+            .map(|l| [l[0] as f32, l[1] as f32, l[2] as f32, 0.0])
+            .collect();
+        let (device, queue) = init_test_wgpu();
+        let gpu = super::gpu_grad(&device, &queue, &scene, &goal_f32, w, h, tau as f32);
+        let cpu = grad_loss(&scene, &goal_f64, w, h, tau);
+        let mut maxrel = 0.0f64;
+        for t in 0..scene.len() {
+            for vert in 0..3 {
+                for c in 0..6 {
+                    let a = cpu[t][vert][c];
+                    let b = gpu[t * 18 + vert * 6 + c] as f64;
+                    let scale = a.abs().max(b.abs()).max(1e-4);
+                    maxrel = maxrel.max((a - b).abs() / scale);
+                }
+            }
+        }
+        println!("GPU grad vs CPU max rel err: {maxrel}");
+        assert!(maxrel < 2e-2, "GPU grad vs CPU max rel err {maxrel} exceeds 2e-2");
     }
 }
