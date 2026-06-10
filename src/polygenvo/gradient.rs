@@ -33,6 +33,26 @@ struct SoftRasterParams {
     tau: f32,
 }
 
+/// Flatten a scene (slice of `ParamTri`) into a `Vec<f32>` in the layout the
+/// shaders expect (t*18 + k*6 + c). Pushes a dummy `0.0` when the scene is empty
+/// so the resulting storage buffer is non-zero sized (wgpu/WGSL requirement).
+#[cfg(test)]
+fn flatten_scene(scene: &[crate::softras_ref::ParamTri]) -> Vec<f32> {
+    let mut flat: Vec<f32> = Vec::with_capacity(scene.len() * 18);
+    for tri in scene {
+        for vert in tri {
+            for &comp in vert {
+                flat.push(comp as f32);
+            }
+        }
+    }
+    // at least one element so the storage buffer is non-zero sized
+    if flat.is_empty() {
+        flat.push(0.0);
+    }
+    flat
+}
+
 /// Run the `softraster.wgsl` forward pass on the GPU and return per-pixel Lab
 /// as `Vec<[f32; 4]>` (L, a, b, 0), row-major (y * width + x). Test-only: the
 /// production polish path (Task 8) never reads Lab back; this function exists
@@ -50,18 +70,7 @@ pub(crate) fn gpu_forward_lab(
 
     // 1. Flatten scene -> Vec<f32>: t*18 + k*6 + c.
     let num_tris = scene.len() as u32;
-    let mut flat: Vec<f32> = Vec::with_capacity(scene.len() * 18);
-    for tri in scene {
-        for vert in tri {
-            for &comp in vert {
-                flat.push(comp as f32);
-            }
-        }
-    }
-    // Ensure at least one element so the storage buffer is non-zero sized.
-    if flat.is_empty() {
-        flat.push(0.0);
-    }
+    let flat = flatten_scene(scene);
 
     // 2. Params uniform (16 bytes).
     let params = SoftRasterParams { width: w, height: h, num_tris, tau };
@@ -187,17 +196,7 @@ pub(crate) fn gpu_grad(
     use wgpu::util::DeviceExt;
 
     let num_tris = scene.len() as u32;
-    let mut flat: Vec<f32> = Vec::with_capacity(scene.len() * 18);
-    for tri in scene {
-        for vert in tri {
-            for &comp in vert {
-                flat.push(comp as f32);
-            }
-        }
-    }
-    if flat.is_empty() {
-        flat.push(0.0);
-    }
+    let flat = flatten_scene(scene);
 
     let params = SoftRasterParams { width: w, height: h, num_tris, tau };
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -216,7 +215,7 @@ pub(crate) fn gpu_grad(
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let grad_len = (num_tris.max(1) * 18) as u64;
+    let grad_len = (num_tris.max(1) * 18) as u64; // .max(1): non-zero-sized buffer even for an empty scene
     let grad_size = grad_len * 4;
     let grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("SoftRaster Grad Accum"),

@@ -120,10 +120,11 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ---------------------------------------------------------------------------
 // BACKWARD pass: ∂(Lab-MSE loss)/∂params, scattered into `grad` via atomic-add.
 // Mirrors softras_ref::grad_loss term-for-term (finite-difference-verified).
-// Per pixel this recomputes the forward composite O(num_tris) and then a second
-// O(num_tris) backprop loop, with a suffix-transmittance scan — overall
-// O(num_tris) per pixel here, but the eventual production kernel batches/tiles.
-// Correctness first; the tiled kernel (Task 8) handles performance.
+// Correctness-first brute force: per pixel, for each triangle this recomputes the
+// prefix composite (C_below, inner loop 0..t) and the suffix transmittance
+// (inner loop t+1..m), giving O(num_tris^2) per pixel. Fine for the small test
+// scenes and the off-by-default polish; the deferred tiled kernel will cache
+// per-triangle state (src_a, lin, C_below, suffix-T) to drop this to O(num_tris).
 // ---------------------------------------------------------------------------
 
 // Derivative of srgb_to_linear w.r.t. its argument.
