@@ -149,6 +149,37 @@ flag first; becomes the default once it wins the A/B.
 - **Vanishing gradients for far placement** → by design the ES retains add/split/
   delete/relocate for coarse placement.
 
+## Phase 1 results (2026-06-10, branch `feat/end-to-end-gradient-optimizer`)
+
+Backend switched to PRIMARY (Vulkan selected on AMD RX 7800 XT / RADV); full suite (37
+tests) green on Vulkan. Benchmark (`bench_backend`, ignored test), GL vs Vulkan:
+
+| op | size | GL | Vulkan |
+|---|---|---|---|
+| fitness (200 tris) | 128² | 0.182 ms | 0.141 ms |
+| fitness | 256² | 0.204 ms | 0.158 ms |
+| fitness | 512² | 0.314 ms | 0.252 ms |
+| brute-force polish (100 tris, 10 steps) | 128² | 1334 ms | 1269 ms |
+| brute-force polish (100 tris, 10 steps) | 256² | **crashed** | 8195 ms |
+
+**Findings:**
+- **Vulkan is the right backend** and is kept: fitness scoring is slightly faster, and
+  GL *crashed* on the 256² polish (less robust for heavy compute). Fitness scoring
+  (~0.15–0.31 ms/score) is **not** a bottleneck on either backend.
+- **The brute-force polish is compute-bound, not backend-bound.** It is ~identical on GL
+  and Vulkan at 128² (1334 vs 1269 ms) — the earlier "hang" was the O(num_tris²)-per-pixel
+  backward growing with triangle count (and ×`steps_n`×many polishes), *not* GL atomic
+  slowness. ~127 ms/step at 128² and ~820 ms/step at 256² for only 100 triangles; at
+  512² with 1000+ triangles this is minutes/step. Unusable for an every-step end-to-end
+  loop.
+
+**Decision (gate):** The **tiled kernel (Phase 2) is required** — Vulkan alone does not
+make the polish viable. The budget it must beat: bring the per-gradient-step cost at 512²
+with ~1000 triangles down from minutes to interactive (target: comparable to a few
+fitness scores, i.e. low single-digit ms). Phase 3 (end-to-end loop) depends on Phase 2.
+Next: a dedicated brainstorm→plan for the tiled forward/backward kernel, now that the
+budget and the confirmed need are known.
+
 ## Out of scope
 
 - Replacing the ES's structural role entirely (placement stays discrete/ES).
