@@ -374,7 +374,7 @@ fn flatten_scene(scene: &[crate::softras_ref::ParamTri]) -> Vec<f32> {
 
 /// Run the `softraster.wgsl` forward pass on the GPU and return per-pixel Lab
 /// as `Vec<[f32; 4]>` (L, a, b, 0), row-major (y * width + x). Test-only: the
-/// production polish path (Task 8) never reads Lab back; this function exists
+/// production polish path (`PolishState::polish`) never reads Lab back; this exists
 /// solely to prove GPU == CPU reference within 1e-2.
 #[cfg(test)]
 pub(crate) fn gpu_forward_lab(

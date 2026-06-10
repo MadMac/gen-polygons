@@ -48,12 +48,14 @@ Tunable constants now live next to the module that owns them (genome capacity in
 
 ## Shader pipeline
 
-Both shaders are loaded via `include_str!` and fed to `wgpu` as `ShaderSource::Wgsl`:
+All shaders are loaded via `include_str!` and fed to `wgpu` as `ShaderSource::Wgsl`:
 
 - [shader.wgsl](src/polygenvo/shader.wgsl) — trivial passthrough vertex+fragment for rendering the triangle list.
 - [fitness.wgsl](src/polygenvo/fitness.wgsl) — compute shader; CIEDE2000 per pixel + `atomicAdd` into a single `u32`.
+- [softraster.wgsl](src/polygenvo/softraster.wgsl) — differentiable soft-rasterizer (`forward`/`backward` compute passes) for `--gradient-polish`; CAS atomic-float gradient scatter.
+- [adam.wgsl](src/polygenvo/adam.wgsl) — Adam optimizer update over the polish param buffer.
 
-Edits to either `.wgsl` file take effect on the next `cargo build` because `include_str!` paths are tracked for rebuilds.
+Edits to any `.wgsl` file take effect on the next `cargo build` because `include_str!` paths are tracked for rebuilds.
 
 WGSL syntax is **current (post-1.0)**: `@location(0)`, `@vertex`/`@fragment`/`@compute`, `@group(N) @binding(M)`, comma-separated struct fields. There is no `build.rs`, no `shaderc`, no SPIR-V path.
 
