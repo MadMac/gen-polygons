@@ -577,17 +577,15 @@ impl PolishState {
     /// (`calc.fitness_of`) confirms it beats `parent_fitness`. On accept, mutates
     /// `genome` and returns `Some(new_fitness)`; otherwise leaves `genome`
     /// untouched and returns `None`.
-    pub(crate) fn polish(
+    /// Run `cfg.steps_n` binned gradient (soft-raster + Adam) steps over all
+    /// vertices' positions+colors and return the optimized genome — NO gate. The
+    /// shared core of `polish` (gated) and `polish_ungated`. Caller guards empty.
+    fn apply_gradient_steps(
         &mut self,
-        genome: &mut Vec<crate::genome::Vertex>,
-        parent_fitness: usize,
-        calc: &crate::fitness::FitnessCalc,
+        genome: &[crate::genome::Vertex],
         cfg: &PolishCfg,
-    ) -> Option<usize> {
+    ) -> Vec<crate::genome::Vertex> {
         let n_verts = genome.len();
-        if n_verts == 0 {
-            return None;
-        }
         let num_tris = (n_verts / 3) as u32;
         let num_params = (n_verts * 6) as u32;
 
@@ -742,6 +740,22 @@ impl PolishState {
             })
             .collect();
 
+        candidate
+    }
+
+    /// Gated polish: apply gradient steps to a copy; keep only if the hard ΔE2000
+    /// renderer confirms it beats `parent_fitness` (the (1+λ) no-regression gate).
+    pub(crate) fn polish(
+        &mut self,
+        genome: &mut Vec<crate::genome::Vertex>,
+        parent_fitness: usize,
+        calc: &crate::fitness::FitnessCalc,
+        cfg: &PolishCfg,
+    ) -> Option<usize> {
+        if genome.is_empty() {
+            return None;
+        }
+        let candidate = self.apply_gradient_steps(genome, cfg);
         let cand_fit = calc.fitness_of(&candidate);
         if cand_fit > parent_fitness {
             *genome = candidate;
@@ -749,6 +763,21 @@ impl PolishState {
         } else {
             None
         }
+    }
+
+    /// Ungated apply (for the gradient-primary quality probe): apply gradient
+    /// steps and keep the result unconditionally — no elitist gate. The caller
+    /// tracks best-ever by hard ΔE2000 across calls.
+    #[cfg(test)]
+    pub(crate) fn polish_ungated(
+        &mut self,
+        genome: &mut Vec<crate::genome::Vertex>,
+        cfg: &PolishCfg,
+    ) {
+        if genome.is_empty() {
+            return;
+        }
+        *genome = self.apply_gradient_steps(genome, cfg);
     }
 }
 

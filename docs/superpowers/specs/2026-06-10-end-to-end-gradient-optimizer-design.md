@@ -180,6 +180,39 @@ fitness scores, i.e. low single-digit ms). Phase 3 (end-to-end loop) depends on 
 Next: a dedicated brainstorm→plan for the tiled forward/backward kernel, now that the
 budget and the confirmed need are known.
 
+## Quality probe result — DECISIVE NEGATIVE (2026-06-11, branch `experiment/gradient-quality-probe`)
+
+Before building the full end-to-end loop, a lean probe asked the gating question:
+*can ungated gradient descent push a plateaued baseline genome past the hard-ΔE2000
+ceiling?* (`es::tests::gradient_primary_quality_probe`: baseline ES on a 128² downscale
+of `goal.png` to plateau, then ungated `PolishState::polish_ungated` in chunks, tracking
+best-ever by hard ΔE2000.)
+
+**Result: gradient descent CATASTROPHICALLY DEGRADES the converged genome.** Hard ΔE2000
+fitness fell 926116 → ~590000 (−36%) over the chunks and *never once* matched, let alone
+beat, baseline (best-ever delta = 0). `/tmp/probe_baseline.png` ≡ `/tmp/probe_polished.png`
+(best stayed at baseline).
+
+**Why (now understood):** the **soft Lab-MSE proxy is misaligned with hard ΔE2000 for a
+near-optimal genome.** The ES optimized the genome for the *hard* renderer; minimizing the
+*soft* (τ-blurred) loss moves it *away* from that hard optimum. Milestone 1 (Path B) only
+showed improvement because a grossly-misplaced single triangle had enormous headroom where
+soft and hard agreed — but the silhouette ceiling is a *near-optimal local minimum*, exactly
+where soft and hard diverge. This is also why the hybrid gate rejected every polish during
+active evolution. Fundamental tension: sharp τ aligns soft≈hard but saturates the sigmoid
+(no gradient); soft τ gives gradient but misaligns from hard. No sweet spot delivered for
+*refinement* (probe annealed τ 0.05→0.02).
+
+**Conclusion: the differentiable-rasterizer path does not achieve the quality goal.**
+Gradient-primary does not break the silhouette ceiling — it breaks the genome. The full
+end-to-end loop is NOT worth building on this proxy. The lean probe (a few hundred lines)
+correctly gated this *before* the large rewrite. Banked infrastructure (Phases 1/2/2.5:
+Vulkan backend, validated tiled+binned differentiable kernel, CPU oracle) remains correct
+and reusable; only the *premise* that gradient-on-soft-Lab-MSE refines quality is refuted.
+Any revival needs a fundamentally better-aligned differentiable objective (e.g. a
+differentiable approximation of ΔE2000, or hard-renderer-in-the-loop gradient estimation),
+not more kernel speed.
+
 ## Out of scope
 
 - Replacing the ES's structural role entirely (placement stays discrete/ES).
