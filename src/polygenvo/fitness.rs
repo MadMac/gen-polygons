@@ -216,7 +216,9 @@ impl FitnessCalc {
 
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Fitness Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("fitness.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::gpu::with_color_prelude(include_str!("fitness.wgsl")).into(),
+            ),
         });
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Fitness Compute Pipeline"),
@@ -587,7 +589,8 @@ fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
-/// Linear-RGB (sRGB primaries, D65) → CIE XYZ. Same matrix as `fitness.wgsl`.
+/// Linear-RGB (sRGB primaries, D65) → CIE XYZ. Same matrix as the canonical
+/// `color.wgsl` prelude (`gpu::with_color_prelude`) the GPU shaders use.
 fn linear_rgb_to_xyz(r: f32, g: f32, b: f32) -> [f32; 3] {
     [
         r * 0.4124564 + g * 0.3575761 + b * 0.1804375,
@@ -596,7 +599,7 @@ fn linear_rgb_to_xyz(r: f32, g: f32, b: f32) -> [f32; 3] {
     ]
 }
 
-/// CIE XYZ (D65) → CIELAB. Same constants as `fitness.wgsl`.
+/// CIE XYZ (D65) → CIELAB. Same constants as the canonical `color.wgsl` prelude.
 fn xyz_to_lab(xyz: [f32; 3]) -> [f32; 3] {
     let f = |t: f32| {
         if t > 0.008856 {

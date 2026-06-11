@@ -298,6 +298,45 @@ fn run_timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()
 }
 
+/// Rate-limited progress line for the search loop. Pure formatter — pulled out
+/// of `run_es` to keep the step body readable.
+fn log_progress(
+    step: u64,
+    schedule: &PhaseSchedule,
+    sigma: &OneFifthRule,
+    n_tris: usize,
+    fitness: usize,
+    improvements: u64,
+    started: Instant,
+) {
+    println!(
+        "step {:>6} | phase {} | tris {:>3} | σ_pos={:.3} σ_col={:.3} σ_grad={:.3} | fit {:>7} | improvements {} | {:.1}/s",
+        step,
+        schedule.idx,
+        n_tris,
+        sigma.sigmas.pos,
+        sigma.sigmas.col,
+        sigma.sigmas.grad,
+        fitness,
+        improvements,
+        step as f64 / started.elapsed().as_secs_f64()
+    );
+}
+
+/// Write a full-resolution PNG of `genome` to `dir/filename`, but only when
+/// snapshots are enabled (`dir` is `Some`). Centralises the `if let Some(dir)`
+/// guard repeated at every snapshot site in `run_es`.
+fn snapshot_if(
+    dir: &Option<std::path::PathBuf>,
+    full_res_calc: &FitnessCalc,
+    genome: &[Vertex],
+    filename: &str,
+) {
+    if let Some(dir) = dir {
+        full_res_calc.snapshot(genome, &dir.join(filename));
+    }
+}
+
 pub(crate) fn run_es(
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -350,9 +389,7 @@ pub(crate) fn run_es(
         dir
     });
     // Seed the run folder with the initial state at full resolution.
-    if let Some(dir) = &snapshot_dir {
-        pyramid[full_res].snapshot(&current, &dir.join("image0.png"));
-    }
+    snapshot_if(&snapshot_dir, &pyramid[full_res], &current, "image0.png");
     // Show the initial genome in the live window (if any) before stepping.
     if let Some(obs) = observer.as_deref_mut() {
         obs.on_step(&current, true);
@@ -434,12 +471,12 @@ pub(crate) fn run_es(
         schedule.record(accepted);
 
         // Snapshot occasionally on improvement.
-        if let (Some(snap_every), Some(dir)) = (cfg.snapshot_every, &snapshot_dir)
+        if let Some(snap_every) = cfg.snapshot_every
             && accepted
             && improvements_total > 0
             && improvements_total.is_multiple_of(snap_every)
         {
-            pyramid[full_res].snapshot(&current, &dir.join(format!("image{step}.png")));
+            snapshot_if(&snapshot_dir, &pyramid[full_res], &current, &format!("image{step}.png"));
         }
 
         // Update the live window (if any). Pumps window events every step and
@@ -454,17 +491,14 @@ pub(crate) fn run_es(
 
         // Periodic progress log (rate-limited so output stays readable).
         if last_log.elapsed().as_secs_f32() >= 1.0 {
-            println!(
-                "step {:>6} | phase {} | tris {:>3} | σ_pos={:.3} σ_col={:.3} σ_grad={:.3} | fit {:>7} | improvements {} | {:.1}/s",
+            log_progress(
                 step,
-                schedule.idx,
+                &schedule,
+                &sigma,
                 current.len() / 3,
-                sigma.sigmas.pos,
-                sigma.sigmas.col,
-                sigma.sigmas.grad,
                 current_fitness,
                 improvements_total,
-                step as f64 / started.elapsed().as_secs_f64()
+                started,
             );
             last_log = Instant::now();
         }
@@ -489,10 +523,12 @@ pub(crate) fn run_es(
                     sigma.sigmas,
                     current_fitness,
                 );
-                if let Some(dir) = &snapshot_dir {
-                    pyramid[full_res]
-                        .snapshot(&current, &dir.join(format!("image{}_phase{}.png", step, schedule.idx)));
-                }
+                snapshot_if(
+                    &snapshot_dir,
+                    &pyramid[full_res],
+                    &current,
+                    &format!("image{}_phase{}.png", step, schedule.idx),
+                );
             } else {
                 // No further phases: kick σ back to this phase's initial sizes so
                 // the search re-explores instead of grinding at near-zero step
@@ -515,9 +551,7 @@ pub(crate) fn run_es(
         improvements_total,
         current_fitness
     );
-    if let Some(dir) = &snapshot_dir {
-        pyramid[full_res].snapshot(&current, &dir.join("final.png"));
-    }
+    snapshot_if(&snapshot_dir, &pyramid[full_res], &current, "final.png");
 
     EsResult {
         initial_fitness,

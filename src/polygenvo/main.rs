@@ -34,45 +34,59 @@ fn arg_value(flag: &str) -> Option<String> {
     None
 }
 
+/// Parsed command-line options for `polygenvo`.
+struct Cli {
+    /// `--infinite`: drop the MAX_STEPS ceiling and run until Ctrl-C. A signal
+    /// handler flips a shared flag the ES loop checks each step, so the run stops
+    /// cleanly and still writes its final snapshot/summary (rather than the
+    /// process being hard-killed mid-step).
+    infinite: bool,
+    /// `--show-window`: open a live window that renders the current best
+    /// candidate as the run progresses. Closing it stops the run gracefully (the
+    /// same final-snapshot/summary path as Ctrl-C).
+    show_window: bool,
+    /// `--gradient-polish`: every PolishCfg.every_k accepted improvements, run an
+    /// on-device gradient polish of all triangle positions+colors and keep it
+    /// only if the hard ΔE2000 renderer confirms it beats the parent.
+    gradient_polish: bool,
+    /// `--goal <path>`: image to approximate. Defaults to goal.png.
+    goal: String,
+}
+
+impl Cli {
+    fn parse() -> Cli {
+        let flag = |name: &str| std::env::args().any(|a| a == name);
+        Cli {
+            infinite: flag("--infinite"),
+            show_window: flag("--show-window"),
+            gradient_polish: flag("--gradient-polish"),
+            goal: arg_value("--goal").unwrap_or_else(|| "goal.png".to_string()),
+        }
+    }
+}
+
 fn main() {
     env_logger::init();
 
-    // `--infinite`: drop the MAX_STEPS ceiling and run until Ctrl-C. A signal
-    // handler flips a shared flag the ES loop checks each step, so the run stops
-    // cleanly and still writes its final snapshot/summary (rather than the
-    // process being hard-killed mid-step).
-    let infinite = std::env::args().any(|a| a == "--infinite");
-
-    // `--show-window`: open a live window that renders the current best
-    // candidate as the run progresses. Closing the window stops the run
-    // gracefully (the same final-snapshot/summary path as Ctrl-C).
-    let show_window = std::env::args().any(|a| a == "--show-window");
-
-    // `--gradient-polish`: every PolishCfg.every_k accepted improvements, run an
-    // on-device gradient polish of all triangle positions+colors and keep it only
-    // if the hard ΔE2000 renderer confirms it beats the parent.
-    let gradient_polish = std::env::args().any(|a| a == "--gradient-polish");
-
-    // `--goal <path>`: image to approximate. Defaults to goal.png.
-    let goal_path = arg_value("--goal").unwrap_or_else(|| "goal.png".to_string());
-    let goal = goal::load_goal_image(&goal_path);
+    let cli = Cli::parse();
+    let goal = goal::load_goal_image(&cli.goal);
 
     // In windowed mode the device must be compatible with the window surface, so
     // `window::init_window` brings up both the window and the device together;
     // the headless path keeps using `gpu::init_wgpu`. Either way the ES and the
     // viewer share one device/queue.
-    let mut window_init = show_window.then(|| window::init_window(goal.pixels.width()));
+    let mut window_init = cli.show_window.then(|| window::init_window(goal.pixels.width()));
     let (device, queue) = match &window_init {
         Some(w) => (w.device.clone(), w.queue.clone()),
         None => block_on(gpu::init_wgpu()),
     };
 
     let mut cfg = es::EsConfig::production();
-    cfg.polish.enabled = gradient_polish;
-    if gradient_polish {
+    cfg.polish.enabled = cli.gradient_polish;
+    if cli.gradient_polish {
         println!("Gradient polish enabled (every {} accepted improvements).", cfg.polish.every_k);
     }
-    if infinite {
+    if cli.infinite {
         let stop = Arc::new(AtomicBool::new(false));
         cfg.max_steps = u64::MAX;
         cfg.stop_flag = Some(stop.clone());

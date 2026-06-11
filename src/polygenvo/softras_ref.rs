@@ -1,7 +1,7 @@
 //! CPU reference soft-rasterizer: the golden oracle for the WGSL differentiable
 //! rasterizer. Forward Lab-MSE loss + analytic gradient + Adam, in plain f64 for
 //! finite-difference accuracy. Test-only — the production path is on-device
-//! (`gradient.rs`/`softraster.wgsl`). Mirrors the hard renderer's pixel/clip
+//! (`gradient.rs`/`softraster_tiled.wgsl`). Mirrors the hard renderer's pixel/clip
 //! mapping, color space, and OVER composite so "GPU == this" is a meaningful bar.
 
 /// Pixel-center clip coords for pixel (px, py) in a W×H image. Row 0 = top;

@@ -36,36 +36,13 @@ struct Params {
 const TILE: u32 = 16u;
 
 // ---------------------------------------------------------------------------
-// Shared helpers — copied verbatim from softraster.wgsl.
+// Soft-raster helpers. linear_rgb_to_xyz / xyz_to_lab come from the prepended
+// color.wgsl prelude (gpu::with_color_prelude); srgb_to_linear is local.
 // ---------------------------------------------------------------------------
 
 fn srgb_to_linear(c: f32) -> f32 {
     if (c <= 0.04045) { return c / 12.92; }
     return pow((c + 0.055) / 1.055, 2.4);
-}
-
-// Linear-RGB (sRGB primaries, D65) -> CIE XYZ
-fn linear_rgb_to_xyz(rgb: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(
-        rgb.r * 0.4124564 + rgb.g * 0.3575761 + rgb.b * 0.1804375,
-        rgb.r * 0.2126729 + rgb.g * 0.7151522 + rgb.b * 0.0721750,
-        rgb.r * 0.0193339 + rgb.g * 0.1191920 + rgb.b * 0.9503041
-    );
-}
-
-// CIE XYZ (D65) -> CIELAB
-fn xyz_to_lab(xyz: vec3<f32>) -> vec3<f32> {
-    let xn = xyz.x / 0.95047;
-    let yn = xyz.y / 1.00000;
-    let zn = xyz.z / 1.08883;
-    let fx = select((7.787 * xn) + (16.0 / 116.0), pow(xn, 1.0 / 3.0), xn > 0.008856);
-    let fy = select((7.787 * yn) + (16.0 / 116.0), pow(yn, 1.0 / 3.0), yn > 0.008856);
-    let fz = select((7.787 * zn) + (16.0 / 116.0), pow(zn, 1.0 / 3.0), zn > 0.008856);
-    return vec3<f32>(
-        116.0 * fy - 16.0,
-        500.0 * (fx - fy),
-        200.0 * (fy - fz)
-    );
 }
 
 fn pixel_to_clip(px: u32, py: u32) -> vec2<f32> {
@@ -98,7 +75,7 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var ii: u32 = lo; ii < hi; ii = ii + 1u) {
         let t = tile_list[ii];
         let base = t * 18u;
-        // --- forward per-pixel locals block (verbatim from softraster.wgsl forward) ---
+        // --- forward per-pixel locals block ---
         let v0 = vec2<f32>(tri_params[base + 0u], tri_params[base + 1u]);
         let v1 = vec2<f32>(tri_params[base + 6u], tri_params[base + 7u]);
         let v2 = vec2<f32>(tri_params[base + 12u], tri_params[base + 13u]);
@@ -131,7 +108,7 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------------------
-// Backward gradient helpers — copied verbatim from softraster.wgsl.
+// Backward gradient helpers.
 // ---------------------------------------------------------------------------
 
 // Atomic f32 add via CAS on the u32 bit pattern (core WGSL has no atomic float add).
@@ -207,9 +184,9 @@ fn edge_sd_grad(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> vec4<f32> {
 // ---------------------------------------------------------------------------
 // Backward entry: ONE front-to-back walk over tile-overlapping triangles,
 // reconstructing C_below (prefix color) and suffix transmittance tt via
-// tt = T_final / prefix_trans. The per-triangle gradient block is identical
-// to the finite-difference-verified brute-force backward in softraster.wgsl;
-// only how `below`/`tt` are obtained changes (O(num_tris) vs O(num_tris²)).
+// tt = T_final / prefix_trans. The per-triangle gradient block matches the
+// finite-difference-verified CPU reference (softras_ref.rs `grad_loss`); only
+// how `below`/`tt` are obtained changes (O(num_tris) vs brute-force O(num_tris²)).
 // ---------------------------------------------------------------------------
 
 @compute @workgroup_size(16, 16, 1)

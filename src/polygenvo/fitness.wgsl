@@ -48,29 +48,9 @@ var<storage, read_write> result: SlotResult;
 
 var<workgroup> partials: array<f32, WG_PIXELS>;
 
-// Linear-RGB (sRGB primaries, D65) -> CIE XYZ
-fn linear_rgb_to_xyz(rgb: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(
-        rgb.r * 0.4124564 + rgb.g * 0.3575761 + rgb.b * 0.1804375,
-        rgb.r * 0.2126729 + rgb.g * 0.7151522 + rgb.b * 0.0721750,
-        rgb.r * 0.0193339 + rgb.g * 0.1191920 + rgb.b * 0.9503041
-    );
-}
-
-// CIE XYZ (D65) -> CIELAB
-fn xyz_to_lab(xyz: vec3<f32>) -> vec3<f32> {
-    let xn = xyz.x / 0.95047;
-    let yn = xyz.y / 1.00000;
-    let zn = xyz.z / 1.08883;
-    let fx = select((7.787 * xn) + (16.0 / 116.0), pow(xn, 1.0 / 3.0), xn > 0.008856);
-    let fy = select((7.787 * yn) + (16.0 / 116.0), pow(yn, 1.0 / 3.0), yn > 0.008856);
-    let fz = select((7.787 * zn) + (16.0 / 116.0), pow(zn, 1.0 / 3.0), zn > 0.008856);
-    return vec3<f32>(
-        116.0 * fy - 16.0,
-        500.0 * (fx - fy),
-        200.0 * (fy - fz)
-    );
-}
+// linear_rgb_to_xyz / xyz_to_lab are provided by the prepended color.wgsl
+// prelude (gpu::with_color_prelude) — one shared definition with the polish
+// soft-rasterizer so the fitness gate and the optimiser agree on Lab.
 
 fn deg2rad(d: f32) -> f32 { return d * PI / 180.0; }
 
