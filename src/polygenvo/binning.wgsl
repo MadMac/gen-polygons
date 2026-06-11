@@ -39,10 +39,10 @@ fn tri_tile_range(base: u32) -> vec4<u32> {
     let pxmax = (cxmax + 1.0) * 0.5 * w - 0.5;
     let pymin = (1.0 - cymax) * 0.5 * h - 0.5; // cymax (top) -> smallest py
     let pymax = (1.0 - cymin) * 0.5 * h - 0.5;
-    let txi = clamp(i32(floor(pxmin)) / 16, 0, i32(bp.tiles_x) - 1);
-    let txa = clamp(i32(floor(pxmax)) / 16, 0, i32(bp.tiles_x) - 1);
-    let tyi = clamp(i32(floor(pymin)) / 16, 0, i32(bp.tiles_y) - 1);
-    let tya = clamp(i32(floor(pymax)) / 16, 0, i32(bp.tiles_y) - 1);
+    let txi = clamp(i32(floor(pxmin)) / i32(TILE), 0, i32(bp.tiles_x) - 1);
+    let txa = clamp(i32(floor(pxmax)) / i32(TILE), 0, i32(bp.tiles_x) - 1);
+    let tyi = clamp(i32(floor(pymin)) / i32(TILE), 0, i32(bp.tiles_y) - 1);
+    let tya = clamp(i32(floor(pymax)) / i32(TILE), 0, i32(bp.tiles_y) - 1);
     return vec4<u32>(u32(txi), u32(txa), u32(tyi), u32(tya));
 }
 
@@ -109,6 +109,7 @@ fn fill(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// TODO(perf): @workgroup_size(1) serial insertion sort per tile — fine for small tiles; replace with a parallel sort if per-tile counts grow large.
 // One workgroup per tile: insertion-sort the tile's slice ascending by triangle index.
 @compute @workgroup_size(1)
 fn sort_tiles(@builtin(workgroup_id) wid: vec3<u32>) {

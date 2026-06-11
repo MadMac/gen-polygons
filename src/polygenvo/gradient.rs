@@ -1049,7 +1049,7 @@ pub(crate) fn gpu_bin(
     let overflow_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Bin Overflow"),
         size: 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
 
@@ -1135,6 +1135,12 @@ pub(crate) fn gpu_bin(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
+    let overflow_readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Bin Overflow Readback"),
+        size: 4,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Binning Encoder"),
@@ -1182,6 +1188,7 @@ pub(crate) fn gpu_bin(
     }
     encoder.copy_buffer_to_buffer(&offsets_buf, 0, &off_readback, 0, off_bytes);
     encoder.copy_buffer_to_buffer(&list_buf, 0, &list_readback, 0, list_bytes);
+    encoder.copy_buffer_to_buffer(&overflow_buf, 0, &overflow_readback, 0, 4);
     queue.submit(std::iter::once(encoder.finish()));
 
     // Read back offsets.
@@ -1213,6 +1220,22 @@ pub(crate) fn gpu_bin(
         v[..total].to_vec()
     };
     list_readback.unmap();
+
+    // Assert the tile_list never exceeded its allocated capacity.
+    let overflow_val: u32 = {
+        let slice = overflow_readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            sender.send(r).ok();
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let v: &[u32] = bytemuck::cast_slice(&data);
+        v[0]
+    };
+    overflow_readback.unmap();
+    assert_eq!(overflow_val, 0, "tile_list capacity ({list_cap}) overflowed during binning");
 
     (offsets, list)
 }
@@ -1270,8 +1293,6 @@ mod tests {
 
     #[test]
     fn gpu_binning_matches_cpu_expectation() {
-        use crate::softras_ref::ParamTri;
-        use crate::test_support::init_test_wgpu;
         let w = 48u32;
         let h = 48u32;
         let tau = 0.05f32; // tiles_x = tiles_y = 3
