@@ -1141,26 +1141,30 @@ mod tests {
             println!("fitness {size}² (200 tris): {ms:.3} ms/score");
         }
 
-        // Brute-force polish cost at bounded sizes/steps (128/256 only; small genome)
-        // so this can never hang the suite even on the slow GL backend.
-        for &size in &[128u32, 256] {
-            let goal = make_solid_goal(size, [40, 120, 200]);
-            let calc = FitnessCalc::new_for_test(device.clone(), queue.clone(), &goal, 1);
-            let mut state = super::PolishState::new(&calc, &goal);
-            let mut rng = StdRng::seed_from_u64(2);
-            let mut g = init_genome(&goal, 100, &mut rng);
-            let parent = calc.fitness_of(&g);
-            let cfg = super::PolishCfg {
-                enabled: true,
-                every_k: 1,
-                steps_n: 10,
-                lr: 0.05,
-                tau_start: 0.3,
-                tau_end: 0.05,
-            };
-            let t = Instant::now();
-            let _ = state.polish(&mut g, parent, &calc, &cfg);
-            println!("polish {size}² (100 tris, 10 steps): {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        // Tiled polish cost at full scale (the Phase 2 target): 1000 triangles,
+        // 512² included. `PolishState::polish` runs the tiled forward+backward.
+        // Two τ regimes: soft (0.1, 8τ margin ≈ 0.8 clip → little rejection) and
+        // sharp (0.03, margin ≈ 0.24 → meaningful rejection). Sharp is the regime
+        // late-stage silhouette refinement runs in.
+        for &(tau, label, sizes) in &[
+            (0.1f32, "soft τ=0.10", &[128u32, 256][..]),
+            (0.03f32, "sharp τ=0.03", &[128u32, 256, 512][..]),
+        ] {
+            for &size in sizes {
+                let goal = make_solid_goal(size, [40, 120, 200]);
+                let calc = FitnessCalc::new_for_test(device.clone(), queue.clone(), &goal, 1);
+                let mut state = super::PolishState::new(&calc, &goal);
+                let mut rng = StdRng::seed_from_u64(3);
+                let mut g = init_genome(&goal, 1000, &mut rng);
+                let parent = calc.fitness_of(&g);
+                let cfg = super::PolishCfg {
+                    enabled: true, every_k: 1, steps_n: 2, lr: 0.05, tau_start: tau, tau_end: tau,
+                };
+                let t = Instant::now();
+                let _ = state.polish(&mut g, parent, &calc, &cfg);
+                let total = t.elapsed().as_secs_f64() * 1000.0;
+                println!("tiled polish {size}² (1000 tris, {label}): {:.1} ms/step", total / 2.0);
+            }
         }
     }
 

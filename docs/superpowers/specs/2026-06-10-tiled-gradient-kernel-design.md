@@ -122,6 +122,38 @@ enough to unblock the Phase 3 end-to-end loop.
   semantics) → the forward and backward share one WGSL definition of the stored layout;
   the oracle equality test catches any mismatch.
 
+## Phase 2 results (2026-06-10, branch `feat/tiled-gradient-kernel`)
+
+Built: tiled forward (`softraster_tiled.wgsl`, stores c_full+T_final) and the
+O(num_tris) reverse-transmittance backward, both GPU==CPU-oracle to ~1e-5 incl.
+tile-boundary scenes; wired into `PolishState::polish` (polish improves hard ΔE2000
+484461→517933, gate intact). 39 tests green.
+
+**Benchmark (Vulkan, AMD RX 7800 XT), tiled polish, 1000 triangles:**
+
+| τ | 128² | 256² | 512² |
+|---|---|---|---|
+| soft (0.10) | 377 ms/step | 1395 ms/step | hangs (GPU watchdog) |
+| sharp (0.03) | 108 ms/step | 365 ms/step | **1143 ms/step** |
+
+**Findings:**
+- **Huge algorithmic win:** the O(num_tris) reverse-transmittance backward is ~100×+
+  faster than the brute-force O(num_tris²) (which was minutes/step at 1000 tris/512²),
+  and 512² now *completes* at sharp τ instead of hanging.
+- **But the interactive acceptance bar is NOT met.** ~1.1 s/step at 512²/1000-tris;
+  at the full 10k-triangle budget it would be ~10× worse. Cause: the **listless
+  loop-and-reject is still O(num_tris) per pixel**, and at accuracy-required margins
+  (8τ) rejection only ~halves the work at sharp τ and does nothing at soft τ (margin
+  ≈ full screen). The soft-τ 512² case exceeds the GPU watchdog and TDR-hangs.
+
+**Decision (gate):** Phase 2 delivered the algorithmic win but not interactive 512².
+The **prefix-sum tile binning** (the documented next lever) is needed to make per-pixel
+cost O(triangles-actually-in-tile) instead of O(num_tris) — that is the path to
+interactive at the full triangle budget. Alternatively, Phase 3 could be designed
+around ~0.1–1 s/step (gradient not every step / coarse-res gradient / few steps),
+which is still a large improvement over the merged brute force. **User decision pending**
+before Phase 3.
+
 ## Out of scope
 
 - Explicit prefix-sum / sorted tile binning (future scalability lever).
