@@ -26,8 +26,11 @@ const ADAM_B1: f32 = 0.9;
 const ADAM_B2: f32 = 0.999;
 const ADAM_EPS: f32 = 1e-8;
 
-/// Uniform params for the softraster forward pass. `#[repr(C)]` + Pod so
-/// bytemuck can cast it straight to the 16-byte uniform buffer the shader reads.
+/// Uniform params for the softraster forward/backward passes. `#[repr(C)]` + Pod
+/// so bytemuck casts it straight to the uniform buffer the shaders read. The
+/// non-tiled `softraster.wgsl` only reads the first four fields; the tiled
+/// `softraster_tiled.wgsl` also reads `tiles_x` (to map a pixel to its tile).
+/// Padded to a 16-byte multiple (32 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SoftRasterParams {
@@ -35,12 +38,15 @@ struct SoftRasterParams {
     height: u32,
     num_tris: u32,
     tau: f32,
+    tiles_x: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// Uniform params for `binning.wgsl` (count/scan/fill/sort). Matches the WGSL
 /// `BinParams` struct field-for-field: 8 × u32/f32 = 32 bytes. `#[repr(C)]` + Pod
 /// so bytemuck casts it straight to the uniform buffer.
-#[cfg(test)]
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct BinParams {
@@ -67,6 +73,230 @@ struct AdamUniform {
     num_params: u32,
     pad0: u32,
     pad1: u32,
+}
+
+/// Scene-dependent binning dimensions for `BinResources::write_params` (groups
+/// the per-step fields so the call doesn't exceed clippy's argument limit).
+#[derive(Clone, Copy)]
+struct BinDims {
+    num_tris: u32,
+    tiles_x: u32,
+    tiles_y: u32,
+    width: u32,
+    height: u32,
+    tau: f32,
+}
+
+/// Cached `binning.wgsl` pipelines + buffers. Both the production `PolishState`
+/// and the `#[cfg(test)]` helpers own one of these so the binning pass sequence
+/// (clear counts → count → scan → reset counts → fill → sort_tiles) is written
+/// the same way everywhere. `record` appends the six commands to an encoder;
+/// callers then bind `offsets_buf`(5)/`list_buf`(6) on the forward/backward
+/// tiled bind groups. The bind group references an externally supplied
+/// `tri_params` buffer (so it tracks the same triangle data the kernel reads).
+struct BinResources {
+    bp_buf: wgpu::Buffer,
+    counts_buf: wgpu::Buffer,
+    offsets_buf: wgpu::Buffer,
+    list_buf: wgpu::Buffer,
+    overflow_buf: wgpu::Buffer,
+    list_cap: u32,
+    count_pipeline: wgpu::ComputePipeline,
+    scan_pipeline: wgpu::ComputePipeline,
+    fill_pipeline: wgpu::ComputePipeline,
+    sort_pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+}
+
+impl BinResources {
+    /// Build the binning pipelines + buffers. `num_tiles` sizes `tile_counts`
+    /// (atomic u32) and `tile_offsets` (num_tiles+1); `list_cap` sizes
+    /// `tile_list`. `tri_params` is the externally owned triangle-param storage
+    /// buffer the count/fill passes read.
+    fn new(
+        device: &wgpu::Device,
+        tri_params: &wgpu::Buffer,
+        num_tiles: u64,
+        list_cap: u32,
+    ) -> Self {
+        let bp_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Bin Params"),
+            size: std::mem::size_of::<BinParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Bin TileCounts"),
+            size: num_tiles * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let offsets_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Bin TileOffsets"),
+            size: (num_tiles + 1) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let list_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Bin TileList"),
+            size: (list_cap as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let overflow_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Bin Overflow"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Binning Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("binning.wgsl").into()),
+        });
+        // Explicit shared layout (all six bindings); the four entries each use a
+        // subset, so one bind group drives every pipeline.
+        let storage = |ro: bool| wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: ro },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty,
+            count: None,
+        };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Binning BGL"),
+            entries: &[
+                entry(
+                    0,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                entry(1, storage(true)),
+                entry(2, storage(false)),
+                entry(3, storage(false)),
+                entry(4, storage(false)),
+                entry(5, storage(false)),
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Binning Pipeline Layout"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let make_pipeline = |ep: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(ep),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some(ep),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+        let count_pipeline = make_pipeline("count");
+        let scan_pipeline = make_pipeline("scan");
+        let fill_pipeline = make_pipeline("fill");
+        let sort_pipeline = make_pipeline("sort_tiles");
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Binning Bind Group"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bp_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: tri_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: counts_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: offsets_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: list_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: overflow_buf.as_entire_binding() },
+            ],
+        });
+
+        Self {
+            bp_buf,
+            counts_buf,
+            offsets_buf,
+            list_buf,
+            overflow_buf,
+            list_cap,
+            count_pipeline,
+            scan_pipeline,
+            fill_pipeline,
+            sort_pipeline,
+            bind_group,
+        }
+    }
+
+    /// Write the BinParams uniform for this step (host-side; ordered before the
+    /// next submit). `list_cap` and the `_pad` are filled from this `BinResources`,
+    /// so the caller passes the scene-dependent fields via `BinDims`.
+    fn write_params(&self, queue: &wgpu::Queue, dims: BinDims) {
+        let bp = BinParams {
+            num_tris: dims.num_tris,
+            tiles_x: dims.tiles_x,
+            tiles_y: dims.tiles_y,
+            width: dims.width,
+            height: dims.height,
+            tau: dims.tau,
+            list_cap: self.list_cap,
+            _pad: 0,
+        };
+        queue.write_buffer(&self.bp_buf, 0, bytemuck::bytes_of(&bp));
+    }
+
+    /// Record the binning pass sequence into `encoder`: clear counts (+overflow)
+    /// → count → scan → reset counts → fill → sort_tiles. Leaves `offsets_buf`
+    /// (exclusive prefix sum, total at [num_tiles]) and `list_buf` (per-tile
+    /// triangle indices, draw order) populated for the current BinParams.
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, num_tris: u32, tiles_x: u32, tiles_y: u32) {
+        encoder.clear_buffer(&self.counts_buf, 0, None);
+        encoder.clear_buffer(&self.overflow_buf, 0, None);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("count"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.count_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(num_tris.max(1).div_ceil(64), 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("scan"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.scan_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        // Reset counts to 0 — fill reuses tile_counts as the per-tile cursor.
+        encoder.clear_buffer(&self.counts_buf, 0, None);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fill"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fill_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(num_tris.max(1).div_ceil(64), 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sort_tiles"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.sort_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(tiles_x * tiles_y, 1, 1);
+        }
+    }
 }
 
 /// Cached pipelines + buffers for the on-device gradient polish. Built once per
@@ -101,6 +331,10 @@ pub(crate) struct PolishState {
     state_buf: wgpu::Buffer,
     forward_tiled_bind_group: wgpu::BindGroup,
     backward_tiled_bind_group: wgpu::BindGroup,
+    // Per-tile triangle-list binning (rebuilt each polish step).
+    bin: BinResources,
+    tiles_x: u32,
+    tiles_y: u32,
 }
 
 impl PolishState {
@@ -230,7 +464,21 @@ impl PolishState {
             mapped_at_creation: false,
         });
 
-        // Tiled forward bind group: binding 0=sr_params, 1=params_buf (tri_params), 2=state.
+        // ---- Binning resources (rebuilt each polish step) ----
+        // num_tiles is fixed by the texture size; the per-tile lists are rebuilt
+        // each step (positions move). list_cap is sized generously: num_tiles*256
+        // gives an average headroom of 256 triangle-entries per 16×16 tile, which
+        // at 512² (1024 tiles → 262144 u32 ≈ 1 MiB) comfortably covers the 10000-
+        // triangle budget (mean ≈ tens of entries/tile). The `overflow` flag in
+        // BinResources guards the pathological case (a tile exceeding the cap).
+        let tiles_x = width.div_ceil(16);
+        let tiles_y = height.div_ceil(16);
+        let num_tiles = (tiles_x * tiles_y) as u64;
+        let list_cap = (num_tiles * 256).max(1) as u32;
+        let bin = BinResources::new(&device, &params_buf, num_tiles, list_cap);
+
+        // Tiled forward bind group: 0=sr_params, 1=params_buf (tri_params),
+        //   2=state, 5=tile_offsets, 6=tile_list.
         let fwd_tiled_bgl = forward_tiled_pipeline.get_bind_group_layout(0);
         let forward_tiled_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Polish Tiled Forward Bind Group"),
@@ -248,11 +496,19 @@ impl PolishState {
                     binding: 2,
                     resource: state_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bin.offsets_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: bin.list_buf.as_entire_binding(),
+                },
             ],
         });
 
-        // Tiled backward bind group: binding 0=sr_params, 1=params_buf, 2=state,
-        //   3=goal_lab_buf, 4=grad_buf.
+        // Tiled backward bind group: 0=sr_params, 1=params_buf, 2=state,
+        //   3=goal_lab_buf, 4=grad_buf, 5=tile_offsets, 6=tile_list.
         let bwd_tiled_bgl = backward_tiled_pipeline.get_bind_group_layout(0);
         let backward_tiled_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Polish Tiled Backward Bind Group"),
@@ -278,6 +534,14 @@ impl PolishState {
                     binding: 4,
                     resource: grad_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bin.offsets_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: bin.list_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -301,6 +565,9 @@ impl PolishState {
             state_buf,
             forward_tiled_bind_group,
             backward_tiled_bind_group,
+            bin,
+            tiles_x,
+            tiles_y,
         }
     }
 
@@ -354,7 +621,16 @@ impl PolishState {
                 0.0
             };
             let tau = cfg.tau_start * (cfg.tau_end / cfg.tau_start).powf(frac);
-            let sr = SoftRasterParams { width: self.width, height: self.height, num_tris, tau };
+            let sr = SoftRasterParams {
+                width: self.width,
+                height: self.height,
+                num_tris,
+                tau,
+                tiles_x: self.width.div_ceil(16),
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            };
             self.queue.write_buffer(&self.sr_params_buf, 0, bytemuck::bytes_of(&sr));
             let ap = AdamUniform {
                 lr: cfg.lr,
@@ -367,10 +643,24 @@ impl PolishState {
                 pad1: 0,
             };
             self.queue.write_buffer(&self.adam_params_buf, 0, bytemuck::bytes_of(&ap));
+            // Binning uniform for this step (positions move, so re-bin each step).
+            self.bin.write_params(
+                &self.queue,
+                BinDims {
+                    num_tris,
+                    tiles_x: self.tiles_x,
+                    tiles_y: self.tiles_y,
+                    width: self.width,
+                    height: self.height,
+                    tau,
+                },
+            );
 
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Polish Step Encoder"),
             });
+            // 0. Binning: rebuild per-tile triangle lists for the current params.
+            self.bin.record(&mut enc, num_tris, self.tiles_x, self.tiles_y);
             // 1. Tiled forward: populate per-pixel state = (c_full.rgb, T_final).
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -500,8 +790,17 @@ pub(crate) fn gpu_forward_lab(
     let num_tris = scene.len() as u32;
     let flat = flatten_scene(scene);
 
-    // 2. Params uniform (16 bytes).
-    let params = SoftRasterParams { width: w, height: h, num_tris, tau };
+    // 2. Params uniform. softraster.wgsl reads only width/height/num_tris/tau.
+    let params = SoftRasterParams {
+        width: w,
+        height: h,
+        num_tris,
+        tau,
+        tiles_x: w.div_ceil(16),
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("SoftRaster Params"),
         contents: bytemuck::bytes_of(&params),
@@ -623,9 +922,22 @@ pub(crate) fn gpu_forward_tiled_lab(
 
     let num_tris = scene.len() as u32;
     let flat = flatten_scene(scene);
+    let tiles_x = w.div_ceil(16);
+    let tiles_y = h.div_ceil(16);
+    let num_tiles = (tiles_x * tiles_y) as u64;
+    let list_cap = (num_tris.max(1) * (tiles_x * tiles_y)).max(1);
 
     // params uniform
-    let params = SoftRasterParams { width: w, height: h, num_tris, tau };
+    let params = SoftRasterParams {
+        width: w,
+        height: h,
+        num_tris,
+        tau,
+        tiles_x,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("TiledFwd Params"),
         contents: bytemuck::bytes_of(&params),
@@ -638,6 +950,10 @@ pub(crate) fn gpu_forward_tiled_lab(
         contents: bytemuck::cast_slice(&flat),
         usage: wgpu::BufferUsages::STORAGE,
     });
+
+    // Binning: build the per-tile lists for this scene before the forward.
+    let bin = BinResources::new(device, &tri_buf, num_tiles, list_cap);
+    bin.write_params(queue, BinDims { num_tris, tiles_x, tiles_y, width: w, height: h, tau });
 
     // state storage: vec4<f32> per pixel = (c_full.rgb, T_final)
     let state_size = (w * h * 16) as u64;
@@ -676,12 +992,16 @@ pub(crate) fn gpu_forward_tiled_lab(
             wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: state_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: bin.offsets_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: bin.list_buf.as_entire_binding() },
         ],
     });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("TiledFwd Encoder"),
     });
+    // Populate tile_offsets/tile_list for this scene before the forward.
+    bin.record(&mut encoder, num_tris, tiles_x, tiles_y);
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("TiledFwd Pass"),
@@ -740,7 +1060,16 @@ pub(crate) fn gpu_grad(
     let num_tris = scene.len() as u32;
     let flat = flatten_scene(scene);
 
-    let params = SoftRasterParams { width: w, height: h, num_tris, tau };
+    let params = SoftRasterParams {
+        width: w,
+        height: h,
+        num_tris,
+        tau,
+        tiles_x: w.div_ceil(16),
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("SoftRaster Grad Params"),
         contents: bytemuck::bytes_of(&params),
@@ -852,8 +1181,21 @@ pub(crate) fn gpu_grad_tiled(
 
     let num_tris = scene.len() as u32;
     let flat = flatten_scene(scene);
+    let tiles_x = w.div_ceil(16);
+    let tiles_y = h.div_ceil(16);
+    let num_tiles = (tiles_x * tiles_y) as u64;
+    let list_cap = (num_tris.max(1) * (tiles_x * tiles_y)).max(1);
 
-    let params = SoftRasterParams { width: w, height: h, num_tris, tau };
+    let params = SoftRasterParams {
+        width: w,
+        height: h,
+        num_tris,
+        tau,
+        tiles_x,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("TiledGrad Params"),
         contents: bytemuck::bytes_of(&params),
@@ -864,6 +1206,10 @@ pub(crate) fn gpu_grad_tiled(
         contents: bytemuck::cast_slice(&flat),
         usage: wgpu::BufferUsages::STORAGE,
     });
+
+    // Binning: build the per-tile lists for this scene before forward+backward.
+    let bin = BinResources::new(device, &tri_buf, num_tiles, list_cap);
+    bin.write_params(queue, BinDims { num_tris, tiles_x, tiles_y, width: w, height: h, tau });
     let goal_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("TiledGrad GoalLab"),
         contents: bytemuck::cast_slice(goal_lab),
@@ -926,9 +1272,11 @@ pub(crate) fn gpu_grad_tiled(
             wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: state_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: bin.offsets_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: bin.list_buf.as_entire_binding() },
         ],
     });
-    // backward bindings: 0 params, 1 tri_params, 2 state, 3 goal_lab, 4 grad.
+    // backward bindings: 0 params, 1 tri_params, 2 state, 3 goal_lab, 4 grad, 5 offsets, 6 list.
     let bwd_bgl = bwd_pipeline.get_bind_group_layout(0);
     let bwd_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Tiled Backward Bind Group"),
@@ -939,12 +1287,16 @@ pub(crate) fn gpu_grad_tiled(
             wgpu::BindGroupEntry { binding: 2, resource: state_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: goal_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: grad_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: bin.offsets_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: bin.list_buf.as_entire_binding() },
         ],
     });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("TiledGrad Encoder"),
     });
+    // Populate tile_offsets/tile_list for this scene before forward+backward.
+    bin.record(&mut encoder, num_tris, tiles_x, tiles_y);
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Tiled Forward Pass"),
@@ -1007,120 +1359,15 @@ pub(crate) fn gpu_bin(
     // Generous list capacity; for the test's tiny scene this is small but safe.
     let list_cap = (num_tris.max(1) * (tiles_x * tiles_y)).max(1);
 
-    let bp = BinParams {
-        num_tris,
-        tiles_x,
-        tiles_y,
-        width: w,
-        height: h,
-        tau,
-        list_cap,
-        _pad: 0,
-    };
-    let bp_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Bin Params"),
-        contents: bytemuck::bytes_of(&bp),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
     let tri_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Bin TriParams"),
         contents: bytemuck::cast_slice(&flat),
         usage: wgpu::BufferUsages::STORAGE,
     });
-    let counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Bin TileCounts"),
-        size: num_tiles * 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let bin = BinResources::new(device, &tri_buf, num_tiles, list_cap);
+    bin.write_params(queue, BinDims { num_tris, tiles_x, tiles_y, width: w, height: h, tau });
+
     let offsets_len = num_tiles + 1;
-    let offsets_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Bin TileOffsets"),
-        size: offsets_len * 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let list_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Bin TileList"),
-        size: (list_cap as u64) * 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let overflow_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Bin Overflow"),
-        size: 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Binning Shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("binning.wgsl").into()),
-    });
-    // Explicit layout with all six bindings: each entry references a different
-    // subset, so the auto-derived per-entry layouts differ; a shared explicit
-    // layout lets one bind group (with all six entries) drive every pipeline.
-    let storage = |ro: bool| wgpu::BindingType::Buffer {
-        ty: wgpu::BufferBindingType::Storage { read_only: ro },
-        has_dynamic_offset: false,
-        min_binding_size: None,
-    };
-    let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty,
-        count: None,
-    };
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Binning BGL"),
-        entries: &[
-            entry(
-                0,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-            ),
-            entry(1, storage(true)),
-            entry(2, storage(false)),
-            entry(3, storage(false)),
-            entry(4, storage(false)),
-            entry(5, storage(false)),
-        ],
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("Binning Pipeline Layout"),
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    });
-    let make_pipeline = |entry: &str| {
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(entry),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some(entry),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        })
-    };
-    let count_pipeline = make_pipeline("count");
-    let scan_pipeline = make_pipeline("scan");
-    let fill_pipeline = make_pipeline("fill");
-    let sort_pipeline = make_pipeline("sort_tiles");
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Binning Bind Group"),
-        layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: bp_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: counts_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: offsets_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: list_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: overflow_buf.as_entire_binding() },
-        ],
-    });
-
     let off_bytes = offsets_len * 4;
     let list_bytes = (list_cap as u64) * 4;
     let off_readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1145,50 +1392,10 @@ pub(crate) fn gpu_bin(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Binning Encoder"),
     });
-    // clear counts (and overflow) before count.
-    encoder.clear_buffer(&counts_buf, 0, None);
-    encoder.clear_buffer(&overflow_buf, 0, None);
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("count"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&count_pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(num_tris.max(1).div_ceil(64), 1, 1);
-    }
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("scan"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&scan_pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
-    }
-    // Reset counts to 0 — fill reuses tile_counts as the per-tile cursor.
-    encoder.clear_buffer(&counts_buf, 0, None);
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("fill"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&fill_pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(num_tris.max(1).div_ceil(64), 1, 1);
-    }
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("sort_tiles"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&sort_pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(tiles_x * tiles_y, 1, 1);
-    }
-    encoder.copy_buffer_to_buffer(&offsets_buf, 0, &off_readback, 0, off_bytes);
-    encoder.copy_buffer_to_buffer(&list_buf, 0, &list_readback, 0, list_bytes);
-    encoder.copy_buffer_to_buffer(&overflow_buf, 0, &overflow_readback, 0, 4);
+    bin.record(&mut encoder, num_tris, tiles_x, tiles_y);
+    encoder.copy_buffer_to_buffer(&bin.offsets_buf, 0, &off_readback, 0, off_bytes);
+    encoder.copy_buffer_to_buffer(&bin.list_buf, 0, &list_readback, 0, list_bytes);
+    encoder.copy_buffer_to_buffer(&bin.overflow_buf, 0, &overflow_readback, 0, 4);
     queue.submit(std::iter::once(encoder.finish()));
 
     // Read back offsets.

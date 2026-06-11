@@ -1,14 +1,15 @@
-// Tiled differentiable soft-rasterizer. Each 16×16-pixel workgroup composites
-// only the triangles whose clip-space bbox (expanded by MARGIN_TAU*tau) overlaps
-// the tile. The forward entry stores per-pixel (c_full.rgb, T_final) into a
-// `state` storage buffer so the backward can reconstruct prefix/suffix state in
-// a single O(num_tris) walk instead of the O(num_tris²) brute-force.
+// Tiled differentiable soft-rasterizer. Each pixel iterates only its tile's
+// triangle list (built by binning.wgsl: tile_offsets/tile_list, draw order). The
+// forward entry stores per-pixel (c_full.rgb, T_final) into a `state` storage
+// buffer so the backward can reconstruct prefix/suffix state in a single
+// O(tile_count) walk instead of the O(num_tris²) brute-force.
 
 struct Params {
     width: u32,
     height: u32,
     num_tris: u32,
     tau: f32,
+    tiles_x: u32,
 }
 @group(0) @binding(0) var<uniform> params: Params;
 
@@ -27,8 +28,12 @@ struct Params {
 // `backward`. Cleared to 0 by the host before the pass.
 @group(0) @binding(4) var<storage, read_write> grad: array<atomic<u32>>;
 
+// Per-tile triangle lists from binning.wgsl. `tile_offsets[tile..tile+1]` bounds
+// the slice of `tile_list` (triangle indices, draw order) for this tile.
+@group(0) @binding(5) var<storage, read> tile_offsets: array<u32>;
+@group(0) @binding(6) var<storage, read> tile_list: array<u32>;
+
 const TILE: u32 = 16u;
-const MARGIN_TAU: f32 = 8.0;
 
 // ---------------------------------------------------------------------------
 // Shared helpers — copied verbatim from softraster.wgsl.
@@ -77,39 +82,6 @@ fn edge_sd(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Tile helpers.
-// ---------------------------------------------------------------------------
-
-// Clip-space AABB of the tile containing pixel (px,py), expanded by MARGIN_TAU*tau.
-// Returns (xmin, ymin, xmax, ymax) in clip space.
-// Note: clip x increases with px; clip y DECREASES with py.
-fn tile_clip_aabb(px: u32, py: u32) -> vec4<f32> {
-    let tx = (px / TILE) * TILE;
-    let ty = (py / TILE) * TILE;
-    let tx1 = min(tx + TILE - 1u, params.width - 1u);
-    let ty1 = min(ty + TILE - 1u, params.height - 1u);
-    let c00 = pixel_to_clip(tx, ty);     // top-left pixel center
-    let c11 = pixel_to_clip(tx1, ty1);   // bottom-right pixel center
-    let m = MARGIN_TAU * params.tau;
-    // clip x increases with px; clip y DECREASES with py.
-    let xmin = min(c00.x, c11.x) - m;
-    let xmax = max(c00.x, c11.x) + m;
-    let ymin = min(c00.y, c11.y) - m;
-    let ymax = max(c00.y, c11.y) + m;
-    return vec4<f32>(xmin, ymin, xmax, ymax);
-}
-
-fn tri_overlaps_aabb(base: u32, box_: vec4<f32>) -> bool {
-    // box_: (xmin, ymin, xmax, ymax)
-    let x0 = tri_params[base + 0u]; let y0 = tri_params[base + 1u];
-    let x1 = tri_params[base + 6u]; let y1 = tri_params[base + 7u];
-    let x2 = tri_params[base + 12u]; let y2 = tri_params[base + 13u];
-    let tmin = vec2<f32>(min(x0, min(x1, x2)), min(y0, min(y1, y2)));
-    let tmax = vec2<f32>(max(x0, max(x1, x2)), max(y0, max(y1, y2)));
-    return !(tmax.x < box_.x || tmin.x > box_.z || tmax.y < box_.y || tmin.y > box_.w);
-}
-
-// ---------------------------------------------------------------------------
 // Forward entry: composite overlapping triangles, store (c_full.rgb, T_final).
 // ---------------------------------------------------------------------------
 
@@ -118,14 +90,14 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = gid.x; let py = gid.y;
     if (px >= params.width || py >= params.height) { return; }
     let p = pixel_to_clip(px, py);
-    // TODO(perf): all 256 threads in a tile recompute the same AABB; hoist to
-    // workgroup shared memory if this becomes bandwidth-bound.
-    let aabb = tile_clip_aabb(px, py);
     var c = vec3<f32>(0.0, 0.0, 0.0);
     var tprod = 1.0; // running Π(1 - src_a_clamped) over considered triangles
-    for (var t: u32 = 0u; t < params.num_tris; t = t + 1u) {
+    let tile = (py / TILE) * params.tiles_x + (px / TILE);
+    let lo = tile_offsets[tile];
+    let hi = tile_offsets[tile + 1u];
+    for (var ii: u32 = lo; ii < hi; ii = ii + 1u) {
+        let t = tile_list[ii];
         let base = t * 18u;
-        if (!tri_overlaps_aabb(base, aabb)) { continue; }
         // --- forward per-pixel locals block (verbatim from softraster.wgsl forward) ---
         let v0 = vec2<f32>(tri_params[base + 0u], tri_params[base + 1u]);
         let v1 = vec2<f32>(tri_params[base + 6u], tri_params[base + 7u]);
@@ -245,7 +217,6 @@ fn backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = gid.x; let py = gid.y;
     if (px >= params.width || py >= params.height) { return; }
     let p = pixel_to_clip(px, py);
-    let aabb = tile_clip_aabb(px, py);
     let inv_n = 1.0 / f32(params.width * params.height);
 
     // Forward state stored by `forward`: (c_full.rgb, T_final).
@@ -267,9 +238,12 @@ fn backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     // ---- Single front-to-back walk; reconstruct below/tt per triangle. ----
     var below = vec3<f32>(0.0);
     var prefix_trans = 1.0; // accumulates Π_{j=0..t}(1 - src_a_clamped_j) as we process triangle t
-    for (var t: u32 = 0u; t < params.num_tris; t = t + 1u) {
+    let tile = (py / TILE) * params.tiles_x + (px / TILE);
+    let lo = tile_offsets[tile];
+    let hi = tile_offsets[tile + 1u];
+    for (var ii: u32 = lo; ii < hi; ii = ii + 1u) {
+        let t = tile_list[ii];
         let base = t * 18u;
-        if (!tri_overlaps_aabb(base, aabb)) { continue; }
         let v0 = vec2<f32>(tri_params[base + 0u], tri_params[base + 1u]);
         let v1 = vec2<f32>(tri_params[base + 6u], tri_params[base + 7u]);
         let v2 = vec2<f32>(tri_params[base + 12u], tri_params[base + 13u]);
