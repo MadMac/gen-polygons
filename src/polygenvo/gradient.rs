@@ -59,9 +59,7 @@ struct AdamUniform {
 /// f32 by Adam.
 ///
 /// The production `polish` loop uses the TILED pipelines (`forward_tiled_pipeline` /
-/// `backward_tiled_pipeline`) for the per-step forward+backward. The brute-force
-/// `backward_pipeline` / `backward_bind_group` are kept for the `#[cfg(test)]`
-/// `gpu_grad` / `gpu_forward_lab` helpers — do not remove them.
+/// `backward_tiled_pipeline`) for the per-step forward+backward.
 pub(crate) struct PolishState {
     device: std::sync::Arc<wgpu::Device>,
     queue: std::sync::Arc<wgpu::Queue>,
@@ -74,13 +72,7 @@ pub(crate) struct PolishState {
     sr_params_buf: wgpu::Buffer,
     adam_params_buf: wgpu::Buffer,
     _goal_lab_buf: wgpu::Buffer,
-    // Brute-force pipeline — still used by #[cfg(test)] gpu_grad/gpu_forward_lab helpers.
-    #[allow(dead_code)]
-    backward_pipeline: wgpu::ComputePipeline,
     adam_pipeline: wgpu::ComputePipeline,
-    // Brute-force bind group — still used by #[cfg(test)] gpu_grad/gpu_forward_lab helpers.
-    #[allow(dead_code)]
-    backward_bind_group: wgpu::BindGroup,
     adam_bind_group: wgpu::BindGroup,
     readback_buf: wgpu::Buffer,
     // Tiled forward+backward pipelines (used by the production polish loop).
@@ -162,23 +154,11 @@ impl PolishState {
             mapped_at_creation: false,
         });
 
-        let sr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Polish SoftRaster Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("softraster.wgsl").into()),
-        });
         let adam_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Polish Adam Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("adam.wgsl").into()),
         });
 
-        let backward_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Polish Backward Pipeline"),
-            layout: None,
-            module: &sr_shader,
-            entry_point: Some("backward"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
         let adam_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Polish Adam Pipeline"),
             layout: None,
@@ -186,19 +166,6 @@ impl PolishState {
             entry_point: Some("update"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
-        });
-
-        // backward references bindings 0,1,3,4 — the auto layout includes only those.
-        let backward_bgl = backward_pipeline.get_bind_group_layout(0);
-        let backward_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Polish Backward Bind Group"),
-            layout: &backward_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: sr_params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: goal_lab_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: grad_buf.as_entire_binding() },
-            ],
         });
 
         let adam_bgl = adam_pipeline.get_bind_group_layout(0);
@@ -309,9 +276,7 @@ impl PolishState {
             sr_params_buf,
             adam_params_buf,
             _goal_lab_buf: goal_lab_buf,
-            backward_pipeline,
             adam_pipeline,
-            backward_bind_group,
             adam_bind_group,
             readback_buf,
             forward_tiled_pipeline,
