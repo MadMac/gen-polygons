@@ -105,6 +105,10 @@ pub(crate) struct EsResult {
     pub(crate) initial_fitness: usize,
     pub(crate) final_fitness: usize,
     pub(crate) steps_run: u64,
+    /// The final (best) genome at exit — read only by the (test) gradient-primary
+    /// quality probe; `run_es` always populates it.
+    #[allow(dead_code)]
+    pub(crate) final_genome: Vec<Vertex>,
 }
 
 /// A live observer of the search, called once per step. Lets a viewer (the
@@ -519,6 +523,7 @@ pub(crate) fn run_es(
         initial_fitness,
         final_fitness: current_fitness,
         steps_run: step,
+        final_genome: current,
     }
 }
 
@@ -689,5 +694,73 @@ mod tests {
             result.initial_fitness,
             result.final_fitness
         );
+    }
+
+    /// Gradient-primary QUALITY PROBE (the gating experiment). Does ungated gradient
+    /// descent push a *plateaued* baseline genome past the hard-ΔE2000 ceiling the ES
+    /// got stuck at? Run from the repo root:
+    ///   cargo test --release --bin polygenvo gradient_primary_quality_probe -- --ignored --test-threads=1 --nocapture
+    /// Eyeball /tmp/probe_baseline.png vs /tmp/probe_polished.png for facet softening.
+    #[test]
+    #[ignore = "quality probe; needs goal.png in CWD; see doc comment"]
+    fn gradient_primary_quality_probe() {
+        use crate::fitness::FitnessCalc;
+        use crate::gradient::{PolishCfg, PolishState};
+        use std::path::Path;
+
+        if !Path::new("goal.png").exists() {
+            eprintln!("PROBE skipped: goal.png not found (run from repo root)");
+            return;
+        }
+        let full = crate::goal::load_goal_image("goal.png");
+        let goal = crate::goal::downsample_goal(&full, 128); // tolerable probe resolution
+        let (device, queue) = crate::test_support::init_test_wgpu();
+
+        // 1. Baseline ES to plateau (polish OFF), modest budget.
+        let cfg = EsConfig {
+            phases: PHASES.to_vec(),
+            max_steps: 20_000,
+            lambda: LAMBDA,
+            snapshot_every: None,
+            stop_flag: None,
+            polish: PolishCfg::default(),
+        };
+        let base = run_es(device.clone(), queue.clone(), goal.clone(), cfg, None);
+        let f_base = base.final_fitness;
+        let mut g = base.final_genome;
+        println!("PROBE baseline: {} tris, hard fitness {f_base}", g.len() / 3);
+
+        let calc = FitnessCalc::new_for_test(device.clone(), queue.clone(), &goal, 1);
+        calc.snapshot(&g, Path::new("/tmp/probe_baseline.png"));
+
+        // 2. Ungated gradient-primary; keep best-ever by hard ΔE2000 (the safety net).
+        let mut state = PolishState::new(&calc, &goal);
+        let pcfg = PolishCfg {
+            enabled: true,
+            every_k: 1,
+            steps_n: 20,
+            lr: 0.03,
+            tau_start: 0.05,
+            tau_end: 0.02,
+        };
+        let mut best = g.clone();
+        let mut f_best = f_base;
+        for chunk in 0..15 {
+            state.polish_ungated(&mut g, &pcfg);
+            let f = calc.fitness_of(&g);
+            println!("PROBE chunk {chunk}: hard fitness {f}");
+            if f > f_best {
+                f_best = f;
+                best = g.clone();
+            }
+        }
+        calc.snapshot(&best, Path::new("/tmp/probe_polished.png"));
+        println!(
+            "PROBE verdict: baseline {f_base} -> best-ever {f_best} (delta {})",
+            f_best as i64 - f_base as i64
+        );
+        println!("PROBE images: /tmp/probe_baseline.png vs /tmp/probe_polished.png");
+
+        assert!(f_best >= f_base, "best-ever must not be below baseline: {f_best} < {f_base}");
     }
 }
