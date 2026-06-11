@@ -61,6 +61,13 @@ pub(crate) fn rgb_to_lab(r: f64, g: f64, b: f64) -> [f64; 3] {
     xyz_to_lab(linear_rgb_to_xyz(lin[0], lin[1], lin[2]))
 }
 
+/// Convert linear RGB (already linearised, no sRGB gamma) to CIELAB. Used by the
+/// tiled GPU forward helper to convert read-back linear-RGB state to Lab for
+/// comparison against the CPU oracle.
+pub(crate) fn lin_rgb_to_lab(r: f64, g: f64, b: f64) -> [f64; 3] {
+    xyz_to_lab(linear_rgb_to_xyz(r, g, b))
+}
+
 /// One triangle's optimizable params, draw order. v[i] = [cx, cy, r, g, b, a].
 pub(crate) type ParamTri = [[f64; 6]; 3];
 
