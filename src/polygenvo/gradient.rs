@@ -730,8 +730,6 @@ mod tests {
 
     #[test]
     fn gpu_tiled_forward_matches_cpu_reference() {
-        use crate::softras_ref::{forward_pixel_lab, ParamTri};
-        use crate::test_support::init_test_wgpu;
         let w = 40u32; let h = 40u32; let tau = 0.15f64; // >16px so triangles span tiles
         let scene: Vec<ParamTri> = vec![
             [[-0.7, -0.7, 0.8, 0.2, 0.2, 0.8], [0.7, -0.6, 0.2, 0.8, 0.2, 0.8], [0.0, 0.7, 0.2, 0.2, 0.8, 0.8]],

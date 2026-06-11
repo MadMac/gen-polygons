@@ -92,6 +92,7 @@ fn tile_clip_aabb(px: u32, py: u32) -> vec4<f32> {
 }
 
 fn tri_overlaps_aabb(base: u32, box_: vec4<f32>) -> bool {
+    // box_: (xmin, ymin, xmax, ymax)
     let x0 = tri_params[base + 0u]; let y0 = tri_params[base + 1u];
     let x1 = tri_params[base + 6u]; let y1 = tri_params[base + 7u];
     let x2 = tri_params[base + 12u]; let y2 = tri_params[base + 13u];
@@ -109,6 +110,8 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = gid.x; let py = gid.y;
     if (px >= params.width || py >= params.height) { return; }
     let p = pixel_to_clip(px, py);
+    // TODO(perf): all 256 threads in a tile recompute the same AABB; hoist to
+    // workgroup shared memory if this becomes bandwidth-bound.
     let aabb = tile_clip_aabb(px, py);
     var c = vec3<f32>(0.0, 0.0, 0.0);
     var tprod = 1.0; // running Π(1 - src_a_clamped) over considered triangles
