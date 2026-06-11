@@ -57,6 +57,11 @@ struct AdamUniform {
 /// `params_buf` doubles as backward's `tri_params` and Adam's `params`; the
 /// `grad_buf` is written (atomic f32-via-u32) by backward and re-read as plain
 /// f32 by Adam.
+///
+/// The production `polish` loop uses the TILED pipelines (`forward_tiled_pipeline` /
+/// `backward_tiled_pipeline`) for the per-step forward+backward. The brute-force
+/// `backward_pipeline` / `backward_bind_group` are kept for the `#[cfg(test)]`
+/// `gpu_grad` / `gpu_forward_lab` helpers — do not remove them.
 pub(crate) struct PolishState {
     device: std::sync::Arc<wgpu::Device>,
     queue: std::sync::Arc<wgpu::Queue>,
@@ -69,11 +74,24 @@ pub(crate) struct PolishState {
     sr_params_buf: wgpu::Buffer,
     adam_params_buf: wgpu::Buffer,
     _goal_lab_buf: wgpu::Buffer,
+    // Brute-force pipeline — still used by #[cfg(test)] gpu_grad/gpu_forward_lab helpers.
+    #[allow(dead_code)]
     backward_pipeline: wgpu::ComputePipeline,
     adam_pipeline: wgpu::ComputePipeline,
+    // Brute-force bind group — still used by #[cfg(test)] gpu_grad/gpu_forward_lab helpers.
+    #[allow(dead_code)]
     backward_bind_group: wgpu::BindGroup,
     adam_bind_group: wgpu::BindGroup,
     readback_buf: wgpu::Buffer,
+    // Tiled forward+backward pipelines (used by the production polish loop).
+    forward_tiled_pipeline: wgpu::ComputePipeline,
+    backward_tiled_pipeline: wgpu::ComputePipeline,
+    // Per-pixel state buffer: vec4<f32> = (c_full.rgb, T_final), w*h elements.
+    // Only directly accessed here during construction; used indirectly via bind groups.
+    #[allow(dead_code)]
+    state_buf: wgpu::Buffer,
+    forward_tiled_bind_group: wgpu::BindGroup,
+    backward_tiled_bind_group: wgpu::BindGroup,
 }
 
 impl PolishState {
@@ -196,6 +214,89 @@ impl PolishState {
             ],
         });
 
+        // ---- Tiled pipelines (softraster_tiled.wgsl) ----
+        let tiled_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Polish Tiled Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("softraster_tiled.wgsl").into()),
+        });
+        let forward_tiled_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Polish Tiled Forward Pipeline"),
+                layout: None,
+                module: &tiled_shader,
+                entry_point: Some("forward"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let backward_tiled_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Polish Tiled Backward Pipeline"),
+                layout: None,
+                module: &tiled_shader,
+                entry_point: Some("backward"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+        // Persistent per-pixel state buffer: one vec4<f32> per pixel (16 bytes each).
+        let state_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Polish TiledState"),
+            size: (width as u64) * (height as u64) * 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        // Tiled forward bind group: binding 0=sr_params, 1=params_buf (tri_params), 2=state.
+        let fwd_tiled_bgl = forward_tiled_pipeline.get_bind_group_layout(0);
+        let forward_tiled_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Polish Tiled Forward Bind Group"),
+            layout: &fwd_tiled_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: sr_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: state_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Tiled backward bind group: binding 0=sr_params, 1=params_buf, 2=state,
+        //   3=goal_lab_buf, 4=grad_buf.
+        let bwd_tiled_bgl = backward_tiled_pipeline.get_bind_group_layout(0);
+        let backward_tiled_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Polish Tiled Backward Bind Group"),
+            layout: &bwd_tiled_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: sr_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: state_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: goal_lab_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: grad_buf.as_entire_binding(),
+                },
+            ],
+        });
+
         Self {
             device,
             queue,
@@ -213,6 +314,11 @@ impl PolishState {
             backward_bind_group,
             adam_bind_group,
             readback_buf,
+            forward_tiled_pipeline,
+            backward_tiled_pipeline,
+            state_buf,
+            forward_tiled_bind_group,
+            backward_tiled_bind_group,
         }
     }
 
@@ -283,16 +389,37 @@ impl PolishState {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Polish Step Encoder"),
             });
-            enc.clear_buffer(&self.grad_buf, 0, None);
+            // 1. Tiled forward: populate per-pixel state = (c_full.rgb, T_final).
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Polish Backward Pass"),
+                    label: Some("Polish Tiled Forward Pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.backward_pipeline);
-                pass.set_bind_group(0, &self.backward_bind_group, &[]);
-                pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+                pass.set_pipeline(&self.forward_tiled_pipeline);
+                pass.set_bind_group(0, &self.forward_tiled_bind_group, &[]);
+                pass.dispatch_workgroups(
+                    self.width.div_ceil(16),
+                    self.height.div_ceil(16),
+                    1,
+                );
             }
+            // 2. Clear grad buffer (before backward, after forward).
+            enc.clear_buffer(&self.grad_buf, 0, None);
+            // 3. Tiled backward: O(num_tris) reverse-transmittance gradient scatter.
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Polish Tiled Backward Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.backward_tiled_pipeline);
+                pass.set_bind_group(0, &self.backward_tiled_bind_group, &[]);
+                pass.dispatch_workgroups(
+                    self.width.div_ceil(16),
+                    self.height.div_ceil(16),
+                    1,
+                );
+            }
+            // 4. Adam update.
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Polish Adam Pass"),
@@ -304,7 +431,7 @@ impl PolishState {
             }
             // Per-step submit: the sr-params/adam uniforms change each step, and write_buffer
             // can't be recorded into an encoder; wgpu orders write_buffer before the next
-            // submit, so each step sees its own uniforms. (Batching is the deferred tiled kernel.)
+            // submit, so each step sees its own uniforms.
             self.queue.submit(std::iter::once(enc.finish()));
         }
 
