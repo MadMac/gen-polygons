@@ -37,6 +37,23 @@ struct SoftRasterParams {
     tau: f32,
 }
 
+/// Uniform params for `binning.wgsl` (count/scan/fill/sort). Matches the WGSL
+/// `BinParams` struct field-for-field: 8 × u32/f32 = 32 bytes. `#[repr(C)]` + Pod
+/// so bytemuck casts it straight to the uniform buffer.
+#[cfg(test)]
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BinParams {
+    num_tris: u32,
+    tiles_x: u32,
+    tiles_y: u32,
+    width: u32,
+    height: u32,
+    tau: f32,
+    list_cap: u32,
+    _pad: u32,
+}
+
 /// Uniform params for the `adam.wgsl` update pass. Matches the WGSL `AdamParams`
 /// struct field-for-field (16 bytes header + two u32 pads → 32 bytes total).
 #[repr(C)]
@@ -966,10 +983,330 @@ pub(crate) fn gpu_grad_tiled(
     out
 }
 
+/// Run the full `binning.wgsl` pipeline (clear → count → scan → reset-counts →
+/// fill → sort_tiles) on the GPU for `scene` and read back `(tile_offsets, tile_list)`.
+/// `tile_offsets` has length `num_tiles + 1` (exclusive prefix sum, total at [n]);
+/// the returned `tile_list` is truncated to `offsets[num_tiles]` (the live entries).
+/// Test-only: proves the binned per-tile lists match the CPU expectation.
+#[cfg(test)]
+pub(crate) fn gpu_bin(
+    device: &std::sync::Arc<wgpu::Device>,
+    queue: &std::sync::Arc<wgpu::Queue>,
+    scene: &[crate::softras_ref::ParamTri],
+    w: u32,
+    h: u32,
+    tau: f32,
+) -> (Vec<u32>, Vec<u32>) {
+    use wgpu::util::DeviceExt;
+
+    let num_tris = scene.len() as u32;
+    let flat = flatten_scene(scene);
+    let tiles_x = w.div_ceil(16);
+    let tiles_y = h.div_ceil(16);
+    let num_tiles = (tiles_x * tiles_y) as u64;
+    // Generous list capacity; for the test's tiny scene this is small but safe.
+    let list_cap = (num_tris.max(1) * (tiles_x * tiles_y)).max(1);
+
+    let bp = BinParams {
+        num_tris,
+        tiles_x,
+        tiles_y,
+        width: w,
+        height: h,
+        tau,
+        list_cap,
+        _pad: 0,
+    };
+    let bp_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Bin Params"),
+        contents: bytemuck::bytes_of(&bp),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let tri_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Bin TriParams"),
+        contents: bytemuck::cast_slice(&flat),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Bin TileCounts"),
+        size: num_tiles * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let offsets_len = num_tiles + 1;
+    let offsets_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Bin TileOffsets"),
+        size: offsets_len * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let list_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Bin TileList"),
+        size: (list_cap as u64) * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let overflow_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Bin Overflow"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Binning Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("binning.wgsl").into()),
+    });
+    // Explicit layout with all six bindings: each entry references a different
+    // subset, so the auto-derived per-entry layouts differ; a shared explicit
+    // layout lets one bind group (with all six entries) drive every pipeline.
+    let storage = |ro: bool| wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only: ro },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty,
+        count: None,
+    };
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Binning BGL"),
+        entries: &[
+            entry(
+                0,
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            ),
+            entry(1, storage(true)),
+            entry(2, storage(false)),
+            entry(3, storage(false)),
+            entry(4, storage(false)),
+            entry(5, storage(false)),
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Binning Pipeline Layout"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let make_pipeline = |entry: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        })
+    };
+    let count_pipeline = make_pipeline("count");
+    let scan_pipeline = make_pipeline("scan");
+    let fill_pipeline = make_pipeline("fill");
+    let sort_pipeline = make_pipeline("sort_tiles");
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Binning Bind Group"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: bp_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: counts_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: offsets_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: list_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: overflow_buf.as_entire_binding() },
+        ],
+    });
+
+    let off_bytes = offsets_len * 4;
+    let list_bytes = (list_cap as u64) * 4;
+    let off_readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Bin Offsets Readback"),
+        size: off_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let list_readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Bin List Readback"),
+        size: list_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Binning Encoder"),
+    });
+    // clear counts (and overflow) before count.
+    encoder.clear_buffer(&counts_buf, 0, None);
+    encoder.clear_buffer(&overflow_buf, 0, None);
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("count"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&count_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(num_tris.max(1).div_ceil(64), 1, 1);
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("scan"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&scan_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    // Reset counts to 0 — fill reuses tile_counts as the per-tile cursor.
+    encoder.clear_buffer(&counts_buf, 0, None);
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fill"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&fill_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(num_tris.max(1).div_ceil(64), 1, 1);
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("sort_tiles"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&sort_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(tiles_x * tiles_y, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&offsets_buf, 0, &off_readback, 0, off_bytes);
+    encoder.copy_buffer_to_buffer(&list_buf, 0, &list_readback, 0, list_bytes);
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Read back offsets.
+    let offsets: Vec<u32> = {
+        let slice = off_readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            sender.send(r).ok();
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let v: &[u32] = bytemuck::cast_slice(&data);
+        v.to_vec()
+    };
+    off_readback.unmap();
+
+    let total = offsets[num_tiles as usize] as usize;
+    let list: Vec<u32> = {
+        let slice = list_readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            sender.send(r).ok();
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let v: &[u32] = bytemuck::cast_slice(&data);
+        v[..total].to_vec()
+    };
+    list_readback.unmap();
+
+    (offsets, list)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::softras_ref::{forward_pixel_lab, ParamTri};
     use crate::test_support::init_test_wgpu;
+
+    /// Rust mirror of `binning.wgsl`'s `tri_tile_range` + count/fill: for each tile,
+    /// the (sorted) set of triangle indices whose clip-bbox+8τ overlaps that tile.
+    /// MUST use identical clip→pixel→tile math as the shader, or the test is moot.
+    pub(crate) fn cpu_expected_tile_lists(
+        scene: &[ParamTri],
+        w: u32,
+        h: u32,
+        tau: f32,
+        tiles_x: u32,
+        tiles_y: u32,
+    ) -> Vec<Vec<u32>> {
+        const MARGIN_TAU: f32 = 8.0;
+        let mut out: Vec<Vec<u32>> = vec![Vec::new(); (tiles_x * tiles_y) as usize];
+        for (t, tri) in scene.iter().enumerate() {
+            let (x0, y0) = (tri[0][0] as f32, tri[0][1] as f32);
+            let (x1, y1) = (tri[1][0] as f32, tri[1][1] as f32);
+            let (x2, y2) = (tri[2][0] as f32, tri[2][1] as f32);
+            let m = MARGIN_TAU * tau;
+            let cxmin = x0.min(x1).min(x2) - m;
+            let cxmax = x0.max(x1).max(x2) + m;
+            let cymin = y0.min(y1).min(y2) - m;
+            let cymax = y0.max(y1).max(y2) + m;
+            let wf = w as f32;
+            let hf = h as f32;
+            // clip -> pixel (matches tri_tile_range exactly, including y-flip).
+            let pxmin = (cxmin + 1.0) * 0.5 * wf - 0.5;
+            let pxmax = (cxmax + 1.0) * 0.5 * wf - 0.5;
+            let pymin = (1.0 - cymax) * 0.5 * hf - 0.5; // cymax (top) -> smallest py
+            let pymax = (1.0 - cymin) * 0.5 * hf - 0.5;
+            let txi = (pxmin.floor() as i32 / 16).clamp(0, tiles_x as i32 - 1);
+            let txa = (pxmax.floor() as i32 / 16).clamp(0, tiles_x as i32 - 1);
+            let tyi = (pymin.floor() as i32 / 16).clamp(0, tiles_y as i32 - 1);
+            let tya = (pymax.floor() as i32 / 16).clamp(0, tiles_y as i32 - 1);
+            for ty in tyi..=tya {
+                for tx in txi..=txa {
+                    let tile = (ty as u32) * tiles_x + tx as u32;
+                    out[tile as usize].push(t as u32);
+                }
+            }
+        }
+        for cell in &mut out {
+            cell.sort_unstable();
+        }
+        out
+    }
+
+    #[test]
+    fn gpu_binning_matches_cpu_expectation() {
+        use crate::softras_ref::ParamTri;
+        use crate::test_support::init_test_wgpu;
+        let w = 48u32;
+        let h = 48u32;
+        let tau = 0.05f32; // tiles_x = tiles_y = 3
+        let scene: Vec<ParamTri> = vec![
+            [[-0.9, -0.9, 0., 0., 0., 1.], [-0.6, -0.9, 0., 0., 0., 1.], [-0.9, -0.6, 0., 0., 0., 1.]], // corner
+            [[-0.2, -0.2, 0., 0., 0., 1.], [0.3, -0.1, 0., 0., 0., 1.], [0.0, 0.3, 0., 0., 0., 1.]], // centre
+        ];
+        let (device, queue) = init_test_wgpu();
+        let (offsets, list) = super::gpu_bin(&device, &queue, &scene, w, h, tau);
+        let tiles_x = w.div_ceil(16);
+        let tiles_y = h.div_ceil(16);
+        // CPU expectation: per tile, indices whose clip-bbox+8τ overlaps tile.
+        let expect = cpu_expected_tile_lists(&scene, w, h, tau, tiles_x, tiles_y);
+        assert_eq!(offsets[0], 0, "offsets[0] must be 0 (exclusive scan)");
+        for tile in 0..(tiles_x * tiles_y) as usize {
+            let off = offsets[tile] as usize;
+            let end = offsets[tile + 1] as usize;
+            // offsets are the exclusive prefix sum: per-tile count == expected count.
+            assert_eq!(
+                end - off,
+                expect[tile].len(),
+                "tile {tile} count {} != expected {}",
+                end - off,
+                expect[tile].len()
+            );
+            let mut got: Vec<u32> = list[off..end].to_vec();
+            // already sorted strictly ascending; assert so:
+            assert!(
+                got.windows(2).all(|w| w[0] < w[1]),
+                "tile {tile} not sorted ascending: {got:?}"
+            );
+            got.sort_unstable();
+            assert_eq!(got, expect[tile], "tile {tile} list mismatch");
+        }
+    }
 
     #[test]
     fn gpu_tiled_forward_matches_cpu_reference() {
