@@ -1,5 +1,5 @@
 // Adam optimizer update over the flat param buffer (one invocation per scalar
-// param). Reads the gradient buffer (written by softraster.wgsl `backward`,
+// param). Reads the gradient buffer (written by softraster_tiled.wgsl `backward`,
 // re-read here as plain f32 — same bytes), updates bias-corrected moments, steps,
 // and clamps: positions (param index %6 < 2) to [-1,1], colors/alpha to [0,1].
 

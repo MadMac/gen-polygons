@@ -18,6 +18,16 @@ pub(crate) fn preferred_backends() -> wgpu::Backends {
     backends_from_env(std::env::var("POLYGENVO_BACKEND").ok().as_deref())
 }
 
+/// Prepend the canonical CIE color primitives (`color.wgsl`) to a shader body,
+/// so the fitness evaluator (`fitness.wgsl`) and the soft-rasterizer
+/// (`softraster_tiled.wgsl`) share one definition of the linear-RGB→XYZ→Lab
+/// pipeline. They must agree for the elitist polish gate to hold. The prelude is
+/// declarations only (no `enable`/`requires` directives), so prepending it is
+/// always valid; the shared fns then precede any use in the body.
+pub(crate) fn with_color_prelude(body: &str) -> String {
+    format!("{}\n{}", include_str!("color.wgsl"), body)
+}
+
 async fn try_backend(backends: wgpu::Backends) -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
