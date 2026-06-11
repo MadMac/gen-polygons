@@ -466,15 +466,16 @@ impl PolishState {
 
         // ---- Binning resources (rebuilt each polish step) ----
         // num_tiles is fixed by the texture size; the per-tile lists are rebuilt
-        // each step (positions move). list_cap is sized generously: num_tiles*256
-        // gives an average headroom of 256 triangle-entries per 16×16 tile, which
-        // at 512² (1024 tiles → 262144 u32 ≈ 1 MiB) comfortably covers the 10000-
-        // triangle budget (mean ≈ tens of entries/tile). The `overflow` flag in
-        // BinResources guards the pathological case (a tile exceeding the cap).
+        // each step (positions move). list_cap = num_tiles*1024 sizes the total
+        // triangle-tile-incidence buffer (at 512²: 1024 tiles → ~1.05M u32 ≈ 4 MiB).
+        // Realistic late-stage genomes (10000 *small* triangles) need only tens of
+        // entries/tile; the generous headroom also covers denser/larger-triangle
+        // mid-run genomes before splitting. The `overflow` flag in BinResources
+        // guards the pathological case (total incidences exceeding the cap).
         let tiles_x = width.div_ceil(16);
         let tiles_y = height.div_ceil(16);
         let num_tiles = (tiles_x * tiles_y) as u64;
-        let list_cap = (num_tiles * 256).max(1) as u32;
+        let list_cap = (num_tiles * 1024).max(1) as u32;
         let bin = BinResources::new(&device, &params_buf, num_tiles, list_cap);
 
         // Tiled forward bind group: 0=sr_params, 1=params_buf (tri_params),
@@ -1706,30 +1707,41 @@ mod tests {
             println!("fitness {size}² (200 tris): {ms:.3} ms/score");
         }
 
-        // Tiled polish cost at full scale (the Phase 2 target): 1000 triangles,
-        // 512² included. `PolishState::polish` runs the tiled forward+backward.
-        // Two τ regimes: soft (0.1, 8τ margin ≈ 0.8 clip → little rejection) and
-        // sharp (0.03, margin ≈ 0.24 → meaningful rejection). Sharp is the regime
-        // late-stage silhouette refinement runs in.
-        for &(tau, label, sizes) in &[
-            (0.1f32, "soft τ=0.10", &[128u32, 256][..]),
-            (0.03f32, "sharp τ=0.03", &[128u32, 256, 512][..]),
-        ] {
-            for &size in sizes {
-                let goal = make_solid_goal(size, [40, 120, 200]);
-                let calc = FitnessCalc::new_for_test(device.clone(), queue.clone(), &goal, 1);
-                let mut state = super::PolishState::new(&calc, &goal);
-                let mut rng = StdRng::seed_from_u64(3);
-                let mut g = init_genome(&goal, 1000, &mut rng);
-                let parent = calc.fitness_of(&g);
-                let cfg = super::PolishCfg {
-                    enabled: true, every_k: 1, steps_n: 2, lr: 0.05, tau_start: tau, tau_end: tau,
-                };
-                let t = Instant::now();
-                let _ = state.polish(&mut g, parent, &calc, &cfg);
-                let total = t.elapsed().as_secs_f64() * 1000.0;
-                println!("tiled polish {size}² (1000 tris, {label}): {:.1} ms/step", total / 2.0);
+        // Binned polish at the Phase-2.5 target: 512², sharp τ=0.03 (the late-stage
+        // refinement regime), at 1000 and 3000 triangles. Compare against the
+        // Phase-2 listless tiled kernel (1143 ms/step at 512²/1000-tris, sharp τ).
+        // Both counts' triangle-tile incidences fit list_cap (num_tiles*1024 ≈ 1.05M
+        // at 512²): 1000 large tris ≈ 290k, 3000 ≈ 870k — no overflow, valid timing.
+        // `init_genome` makes LARGE triangles (radius ~0.3) that cover most tiles —
+        // unrealistic for a refined genome and it defeats tiling/binning. `shrink`
+        // pulls each triangle's vertices toward its centroid to simulate the small
+        // triangles a real late-stage (split-refined) genome has, where binning's
+        // per-tile reduction actually applies.
+        let shrink = |g: &mut Vec<crate::genome::Vertex>, f: f32| {
+            for tri in g.chunks_mut(3) {
+                let cx = (tri[0].position[0] + tri[1].position[0] + tri[2].position[0]) / 3.0;
+                let cy = (tri[0].position[1] + tri[1].position[1] + tri[2].position[1]) / 3.0;
+                for v in tri.iter_mut() {
+                    v.position[0] = cx + (v.position[0] - cx) * f;
+                    v.position[1] = cy + (v.position[1] - cy) * f;
+                }
             }
+        };
+        for &(ntris, f, label) in &[(1000usize, 1.0f32, "large"), (1000, 0.15, "small")] {
+            let size = 512u32;
+            let goal = make_solid_goal(size, [40, 120, 200]);
+            let calc = FitnessCalc::new_for_test(device.clone(), queue.clone(), &goal, 1);
+            let mut state = super::PolishState::new(&calc, &goal);
+            let mut rng = StdRng::seed_from_u64(3);
+            let mut g = init_genome(&goal, ntris, &mut rng);
+            shrink(&mut g, f);
+            let parent = calc.fitness_of(&g);
+            let cfg = super::PolishCfg {
+                enabled: true, every_k: 1, steps_n: 3, lr: 0.05, tau_start: 0.03, tau_end: 0.03,
+            };
+            let t = Instant::now();
+            let _ = state.polish(&mut g, parent, &calc, &cfg);
+            println!("binned polish 512² ({ntris} tris, {label}, sharp τ=0.03): {:.1} ms/step", t.elapsed().as_secs_f64() * 1000.0 / 3.0);
         }
     }
 

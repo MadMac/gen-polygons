@@ -114,6 +114,42 @@ speedup over the listless tiled kernel at 512² (target: tens-of-ms/step), and i
 - **`count` vs `fill` must use the identical bbox→tile mapping** (same margin, same clamp)
   or slots mismatch → factor the mapping into one shared WGSL helper used by both.
 
+## Phase 2.5 results (2026-06-10, branch `feat/tile-binning`)
+
+Built: `binning.wgsl` (count → exclusive scan → fill → per-tile sort), GPU==CPU-verified
+per-tile lists; forward/backward iterate `tile_list[off..off+cnt]`; `PolishState` re-bins
+each step. All oracle tests pass **unchanged** through the binned path (forward Lab
+2.2e-5, backward rel 1.3e-5), polish improves hard ΔE2000 (484461→517938), 40 tests green.
+
+**Benchmark (Vulkan, AMD RX 7800 XT), binned polish, 512², sharp τ=0.03:**
+
+| genome | ms/step |
+|---|---|
+| 1000 tris, **large** (`init_genome`, radius ~0.3) | 1306 |
+| 1000 tris, **small** (shrunk ×0.15 — realistic refined genome) | **790** |
+| (Phase-2 listless tiled, 1000 large, for reference) | 1143 |
+
+**Findings:**
+- **Binning works and helps — but modestly (~1.65× on realistic small triangles), not
+  the hoped order-of-magnitude.** With `init_genome`'s large triangles it gives ~nothing
+  (1306 vs 1143) because each triangle covers ~290 of 1024 tiles → ~283 tris/tile.
+- **The 8τ margin is the fundamental limiter.** At τ=0.03 the margin is 0.24 clip, so even
+  a *small* triangle's tile footprint is ~16 tiles → ~16 tris/tile at 1000 tris. The
+  per-pixel backward (heavy gradient block) over ~16 triangles, ×262k pixels, ×per-step
+  binning + submit overhead, still costs ~0.8 s/step.
+- **The interactive acceptance bar (tens-of-ms) is NOT met.** 512² differentiable polish
+  remains ~hundreds-of-ms to ~1 s per step even with binning + small triangles.
+
+**Decision (gate): the differentiable-rasterizer path is not reaching interactive 512²
+on this approach.** Binning is a real, banked improvement but not the finish line.
+Remaining levers, none guaranteed and each its own effort: (a) shrink the margin (e.g.
+5τ — risks accuracy vs the oracle), (b) batch all N steps into one submit (cut per-step
+overhead), (c) lighten the per-triangle backward, (d) polish a *subset* of triangles, or
+(e) run gradient at coarse resolution. **Recommendation: pause the speed chase and re-probe
+quality** — run a Phase-3 end-to-end probe at a tolerable scale (small image / capped tris)
+to learn whether gradient-primary actually beats baseline *at all* before investing more in
+speed. If the quality win isn't there, further kernel optimization is wasted.
+
 ## Out of scope
 
 - Multi-block GPU scan for very large images (future lever; single-workgroup scan now).
