@@ -903,7 +903,7 @@ mod tests {
         use crate::softras_ref::{grad_loss, rgb_to_lab, ParamTri};
         use crate::test_support::init_test_wgpu;
         let (device, queue) = init_test_wgpu();
-        // Three scenes: single triangle (FD scene), two overlapping, tile-spanning.
+        // Two scenes: single triangle (FD scene); two overlapping, tile-spanning.
         let scenes: Vec<(u32, u32, f64, Vec<ParamTri>)> = vec![
             (12, 12, 0.15, vec![[[-0.4,-0.3,0.7,0.2,0.6,0.8],[0.5,-0.4,0.2,0.7,0.3,0.8],[0.1,0.6,0.4,0.4,0.9,0.8]]]),
             (40, 40, 0.12, vec![

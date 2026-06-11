@@ -151,7 +151,7 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
         let src_a = cov * a;
         let lin = vec3<f32>(srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b));
         // --- end verbatim block ---
-        let src_a_clamped = min(src_a, 0.999);
+        let src_a_clamped = min(src_a, 0.999); // cap keeps prefix_trans > 0 (backward divides T_final/prefix_trans)
         c = src_a * lin + (1.0 - src_a) * c;           // composite uses TRUE src_a
         tprod = tprod * (1.0 - src_a_clamped);         // transmittance uses CLAMPED src_a
     }
@@ -266,7 +266,7 @@ fn backward(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // ---- Single front-to-back walk; reconstruct below/tt per triangle. ----
     var below = vec3<f32>(0.0);
-    var prefix_trans = 1.0; // running Π_{j<=t}(1 - src_a_clamped)
+    var prefix_trans = 1.0; // accumulates Π_{j=0..t}(1 - src_a_clamped_j) as we process triangle t
     for (var t: u32 = 0u; t < params.num_tris; t = t + 1u) {
         let base = t * 18u;
         if (!tri_overlaps_aabb(base, aabb)) { continue; }
@@ -345,7 +345,7 @@ fn backward(@builtin(global_invocation_id) gid: vec3<u32>) {
         let lin = vec3<f32>(srgb_to_linear(rgb.x), srgb_to_linear(rgb.y), srgb_to_linear(rgb.z));
 
         // --- reconstruct below_t / tt from the running walk (replaces inner loops) ---
-        let src_a_clamped = min(src_a, 0.999);
+        let src_a_clamped = min(src_a, 0.999); // cap keeps prefix_trans > 0 (backward divides T_final/prefix_trans)
         prefix_trans = prefix_trans * (1.0 - src_a_clamped); // update BEFORE computing tt
         let tt = t_final / prefix_trans;                     // suffix transmittance Π_{j>t}
         let below_t = below;                                 // composite of 0..t-1
