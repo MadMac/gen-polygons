@@ -723,6 +723,157 @@ pub(crate) fn gpu_grad(
     out
 }
 
+/// Run the `softraster_tiled.wgsl` forward+backward passes on the GPU and return
+/// the flat per-param gradient (len num_tris*18, layout t*18 + k*6 + c). The
+/// tiled backward needs the forward's `state`, so both run in one encoder:
+/// forward (bindings 0,1,2) populates `state`, then `clear_buffer(grad)`, then
+/// backward (bindings 0,1,2,3,4). Test-only: proves the tiled O(num_tris) grad
+/// matches the CPU reference within rel 2e-2.
+#[cfg(test)]
+pub(crate) fn gpu_grad_tiled(
+    device: &std::sync::Arc<wgpu::Device>,
+    queue: &std::sync::Arc<wgpu::Queue>,
+    scene: &[crate::softras_ref::ParamTri],
+    goal_lab: &[[f32; 4]],
+    w: u32,
+    h: u32,
+    tau: f32,
+) -> Vec<f32> {
+    use wgpu::util::DeviceExt;
+
+    let num_tris = scene.len() as u32;
+    let flat = flatten_scene(scene);
+
+    let params = SoftRasterParams { width: w, height: h, num_tris, tau };
+    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("TiledGrad Params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let tri_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("TiledGrad TriParams"),
+        contents: bytemuck::cast_slice(&flat),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let goal_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("TiledGrad GoalLab"),
+        contents: bytemuck::cast_slice(goal_lab),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    // Per-pixel forward state: vec4<f32> = (c_full.rgb, T_final).
+    let state_size = (w * h * 16) as u64;
+    let state_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("TiledGrad State"),
+        size: state_size,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let grad_len = (num_tris.max(1) * 18) as u64; // .max(1): non-zero-sized buffer even for an empty scene
+    let grad_size = grad_len * 4;
+    let grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("TiledGrad Accum"),
+        size: grad_size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("TiledGrad Readback"),
+        size: grad_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Tiled Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("softraster_tiled.wgsl").into()),
+    });
+    let fwd_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Tiled Forward Pipeline"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("forward"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let bwd_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Tiled Backward Pipeline"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("backward"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+
+    // forward bindings: 0 params, 1 tri_params, 2 state.
+    let fwd_bgl = fwd_pipeline.get_bind_group_layout(0);
+    let fwd_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Tiled Forward Bind Group"),
+        layout: &fwd_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: state_buf.as_entire_binding() },
+        ],
+    });
+    // backward bindings: 0 params, 1 tri_params, 2 state, 3 goal_lab, 4 grad.
+    let bwd_bgl = bwd_pipeline.get_bind_group_layout(0);
+    let bwd_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Tiled Backward Bind Group"),
+        layout: &bwd_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: state_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: goal_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: grad_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("TiledGrad Encoder"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Tiled Forward Pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&fwd_pipeline);
+        pass.set_bind_group(0, &fwd_bg, &[]);
+        pass.dispatch_workgroups(w.div_ceil(16), h.div_ceil(16), 1);
+    }
+    encoder.clear_buffer(&grad_buf, 0, None);
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Tiled Backward Pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&bwd_pipeline);
+        pass.set_bind_group(0, &bwd_bg, &[]);
+        pass.dispatch_workgroups(w.div_ceil(16), h.div_ceil(16), 1);
+    }
+    encoder.copy_buffer_to_buffer(&grad_buf, 0, &readback_buf, 0, grad_size);
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = readback_buf.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).ok();
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    receiver.recv().unwrap().unwrap();
+    let out: Vec<f32> = {
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+        floats.to_vec()
+    };
+    readback_buf.unmap();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use crate::softras_ref::{forward_pixel_lab, ParamTri};
@@ -745,6 +896,36 @@ mod tests {
         }}
         println!("tiled forward GPU vs CPU max Lab diff: {maxdiff}");
         assert!(maxdiff < 1e-2, "tiled forward Lab vs CPU max diff {maxdiff} exceeds 1e-2");
+    }
+
+    #[test]
+    fn gpu_tiled_backward_matches_cpu_reference() {
+        use crate::softras_ref::{grad_loss, rgb_to_lab, ParamTri};
+        use crate::test_support::init_test_wgpu;
+        let (device, queue) = init_test_wgpu();
+        // Three scenes: single triangle (FD scene), two overlapping, tile-spanning.
+        let scenes: Vec<(u32, u32, f64, Vec<ParamTri>)> = vec![
+            (12, 12, 0.15, vec![[[-0.4,-0.3,0.7,0.2,0.6,0.8],[0.5,-0.4,0.2,0.7,0.3,0.8],[0.1,0.6,0.4,0.4,0.9,0.8]]]),
+            (40, 40, 0.12, vec![
+                [[-0.6,-0.6,0.8,0.2,0.2,0.7],[0.6,-0.5,0.2,0.8,0.2,0.7],[0.0,0.6,0.2,0.2,0.8,0.7]],
+                [[-0.3,-0.2,0.9,0.9,0.1,0.6],[0.5,-0.1,0.1,0.9,0.9,0.6],[0.0,0.5,0.9,0.1,0.9,0.6]],
+            ]),
+        ];
+        for (w, h, tau, scene) in scenes {
+            let grey = rgb_to_lab(0.5, 0.5, 0.5);
+            let goal_f64: Vec<[f64;3]> = (0..w*h).map(|_| grey).collect();
+            let goal_f32: Vec<[f32;4]> = goal_f64.iter().map(|l| [l[0] as f32,l[1] as f32,l[2] as f32,0.0]).collect();
+            let gpu = super::gpu_grad_tiled(&device, &queue, &scene, &goal_f32, w, h, tau as f32);
+            let cpu = grad_loss(&scene, &goal_f64, w, h, tau);
+            let mut maxrel = 0.0f64;
+            for t in 0..scene.len() { for vert in 0..3 { for c in 0..6 {
+                let a = cpu[t][vert][c]; let b = gpu[t*18+vert*6+c] as f64;
+                let scale = a.abs().max(b.abs()).max(1e-4);
+                maxrel = maxrel.max((a-b).abs()/scale);
+            }}}
+            println!("tiled grad GPU vs CPU ({w}x{h}) max rel err: {maxrel}");
+            assert!(maxrel < 2e-2, "tiled grad vs CPU ({w}x{h}) max rel {maxrel} exceeds 2e-2");
+        }
     }
 
     #[test]
