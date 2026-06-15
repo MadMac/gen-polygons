@@ -62,6 +62,8 @@ struct Cli {
     checkpoint_interval: Option<u64>,
     /// `--label <text>`: label for a new session (when saving).
     label: Option<String>,
+    /// `--delete-session <id>`: delete a saved session by ID.
+    delete_session: Option<i64>,
 }
 
 impl Cli {
@@ -76,6 +78,7 @@ impl Cli {
             load: arg_value("--load").and_then(|s| s.parse().ok()),
             checkpoint_interval: arg_value("--checkpoint-interval").and_then(|s| s.parse().ok()),
             label: arg_value("--label"),
+            delete_session: arg_value("--delete-session").and_then(|s| s.parse().ok()),
         }
     }
 }
@@ -102,6 +105,15 @@ fn main() {
                 "ID: {}, Label: {}, Fitness: {:.2}%, Triangles: {}, Phase: {}, Steps: {}, Updated: {}",
                 s.id, label, fitness_pct, s.triangle_count, s.phase_index, s.steps_run, s.updated_at
             );
+        }
+        return;
+    }
+
+    // Handle --delete-session
+    if let Some(id) = cli.delete_session {
+        match persistence::delete_session(&mut db, id) {
+            Ok(_) => println!("Session {} deleted successfully.", id),
+            Err(e) => eprintln!("Failed to delete session {}: {}", id, e),
         }
         return;
     }
@@ -164,6 +176,13 @@ fn main() {
                 ).expect("failed to create new session"));
                 
                 (session_id, None, Some(label), goal)
+            }
+            Ok(tui::TuiAction::DeleteSession { id }) => {
+                match persistence::delete_session(&mut db, id) {
+                    Ok(_) => println!("Session {} deleted successfully.", id),
+                    Err(e) => eprintln!("Failed to delete session {}: {}", id, e),
+                }
+                return;
             }
             Ok(tui::TuiAction::Exit) => {
                 return;

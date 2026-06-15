@@ -29,6 +29,8 @@ pub enum TuiAction {
     NewSession { label: String },
     /// Resume the session with the given ID
     ResumeSession { id: i64 },
+    /// Delete the session with the given ID
+    DeleteSession { id: i64 },
     /// Exit without running any session
     Exit,
 }
@@ -62,6 +64,7 @@ pub fn run_tui(db_conn: &mut rusqlite::Connection) -> io::Result<TuiAction> {
         list_state: ListState::default().with_selected(Some(0)),
         mode: Mode::SessionSelect,
         new_session_label: String::new(),
+        session_to_delete: None,
     };
 
     // Main loop
@@ -83,6 +86,13 @@ pub fn run_tui(db_conn: &mut rusqlite::Connection) -> io::Result<TuiAction> {
                         }
                         KeyCode::Char('n') => {
                             app.mode = Mode::NewSession;
+                        }
+                        KeyCode::Char('d') => {
+                            let selected = app.list_state.selected();
+                            if selected.is_some() && selected.unwrap() < app.sessions.len() {
+                                app.session_to_delete = Some(app.sessions[selected.unwrap()].id);
+                                app.mode = Mode::ConfirmDelete;
+                            }
                         }
                         KeyCode::Enter => {
                             let selected = app.list_state.selected();
@@ -125,6 +135,21 @@ pub fn run_tui(db_conn: &mut rusqlite::Connection) -> io::Result<TuiAction> {
                         _ => {}
                     }
                 }
+                Mode::ConfirmDelete => {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Enter => {
+                            if let Some(id) = app.session_to_delete {
+                                cleanup_terminal(&mut terminal)?;
+                                return Ok(TuiAction::DeleteSession { id });
+                            }
+                        }
+                        KeyCode::Char('n') | KeyCode::Esc => {
+                            app.mode = Mode::SessionSelect;
+                            app.session_to_delete = None;
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -147,6 +172,7 @@ struct App {
     list_state: ListState,
     mode: Mode,
     new_session_label: String,
+    session_to_delete: Option<i64>,
 }
 
 /// TUI modes
@@ -154,6 +180,7 @@ struct App {
 enum Mode {
     SessionSelect,
     NewSession,
+    ConfirmDelete,
 }
 
 /// UI rendering
@@ -203,7 +230,8 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
                 Line::from(vec![
                     Span::raw("↑/↓: Navigate  "),
                     Span::raw("Enter: Select  "),
-                    Span::raw("n: New Session  "),
+                    Span::raw("n: New  "),
+                    Span::raw("d: Delete  "),
                     Span::raw("q: Quit"),
                 ]),
             ])
@@ -259,6 +287,58 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
                 width: area.width,
                 height: 1,
             });
+        }
+        Mode::ConfirmDelete => {
+            // Create a centered confirmation dialog
+            let block = Block::default()
+                .title("Confirm Delete")
+                .borders(Borders::ALL)
+                .padding(Padding::new(2, 2, 2, 2));
+
+            let area = centered_rect(50, 8, size);
+            f.render_widget(Clear, area);
+            f.render_widget(block, area);
+
+            // Confirmation message
+            if let Some(id) = app.session_to_delete {
+                let message = Paragraph::new(vec![
+                    Line::from(vec![
+                        Span::raw(format!("Delete session {}?", id)),
+                    ]),
+                    Line::from(vec![
+                        Span::raw(""),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("This cannot be undone!", Style::new().fg(ratatui::style::Color::Red)),
+                    ]),
+                ])
+                .block(Block::default());
+
+                let inner_area = Rect {
+                    x: area.x + 2,
+                    y: area.y + 2,
+                    width: area.width - 4,
+                    height: 4,
+                };
+                f.render_widget(message, inner_area);
+
+                // Instructions
+                let instructions = Paragraph::new(vec![
+                    Line::from(vec![
+                        Span::styled("y: Yes", Style::new().fg(ratatui::style::Color::Green)),
+                        Span::raw(" | "),
+                        Span::styled("n: No", Style::new().fg(ratatui::style::Color::Red)),
+                    ]),
+                ])
+                .block(Block::default());
+
+                f.render_widget(instructions, Rect {
+                    x: area.x + 2,
+                    y: area.y + area.height - 2,
+                    width: area.width - 4,
+                    height: 1,
+                });
+            }
         }
     }
 }
