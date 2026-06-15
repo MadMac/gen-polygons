@@ -17,6 +17,11 @@ rand = "0.10"
 ctrlc = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 winit = "0.30"
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "polygenvo"

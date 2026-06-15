@@ -9,6 +9,7 @@ mod genome;
 mod gradient;
 mod goal;
 mod gpu;
+mod persistence;
 mod variation;
 mod window;
 #[cfg(test)]
