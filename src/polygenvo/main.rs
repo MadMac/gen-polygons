@@ -10,6 +10,7 @@ mod gradient;
 mod goal;
 mod gpu;
 mod persistence;
+mod tui;
 mod variation;
 mod window;
 #[cfg(test)]
@@ -105,31 +106,73 @@ fn main() {
         return;
     }
 
-    // Load goal image
-    let goal = goal::load_goal_image(&cli.goal);
+    // Determine if we should use TUI or CLI-only mode
+    // Use TUI if no explicit session selection or creation flags are provided
+    let (session_id, initial_state, session_label, goal) = if cli.load.is_some() || cli.checkpoint_interval.is_some() || cli.label.is_some() {
+        // CLI mode - user specified explicit options
+        let goal = goal::load_goal_image(&cli.goal);
+        
+        // Load session if requested
+        let initial_state = cli.load.map(|id| {
+            persistence::load_session(&mut db, id).expect("failed to load session")
+        });
 
-    // Load session if requested
-    let initial_state = cli.load.map(|id| {
-        persistence::load_session(&mut db, id).expect("failed to load session")
-    });
+        // Get or create session ID for saving
+        let session_id = if let Some(ref cp) = initial_state {
+            // Loading existing session - use its ID
+            cp.session_id
+        } else if cli.checkpoint_interval.is_some() || cli.label.is_some() {
+            // Creating new session - create entry now with label and goal info
+            let mut checkpoint = persistence::Checkpoint::new(cli.label.clone());
+            checkpoint.goal_width = goal.pixels.width();
+            checkpoint.goal_height = goal.pixels.height();
+            checkpoint.goal_pixels = goal.pixels.to_vec();
+            Some(persistence::save_session(
+                &mut db,
+                &checkpoint
+            ).expect("failed to create new session"))
+        } else {
+            // No persistence requested
+            None
+        };
 
-    // Get or create session ID for saving
-    let session_id = if let Some(ref cp) = initial_state {
-        // Loading existing session - use its ID
-        cp.session_id
-    } else if cli.checkpoint_interval.is_some() || cli.label.is_some() {
-        // Creating new session - create entry now with label and goal info
-        let mut checkpoint = persistence::Checkpoint::new(cli.label.clone());
-        checkpoint.goal_width = goal.pixels.width();
-        checkpoint.goal_height = goal.pixels.height();
-        checkpoint.goal_pixels = goal.pixels.to_vec();
-        Some(persistence::save_session(
-            &mut db,
-            &checkpoint
-        ).expect("failed to create new session"))
+        // Get the label for the current session (if any)
+        let session_label = initial_state.as_ref().and_then(|cp| cp.label.clone())
+            .or(cli.label.clone());
+        
+        (session_id, initial_state, session_label, goal)
     } else {
-        // No persistence requested
-        None
+        // TUI mode - run the TUI to select or create a session
+        match tui::run_tui(&mut db) {
+            Ok(tui::TuiAction::ResumeSession { id }) => {
+                let checkpoint = persistence::load_session(&mut db, id).expect("failed to load session");
+                let goal = persistence::create_goal_image_from_checkpoint(&checkpoint);
+                let session_label = checkpoint.label.clone();
+                (Some(id), Some(checkpoint), session_label, goal)
+            }
+            Ok(tui::TuiAction::NewSession { label }) => {
+                let goal = goal::load_goal_image(&cli.goal);
+                
+                // Create new session
+                let mut checkpoint = persistence::Checkpoint::new(Some(label.clone()));
+                checkpoint.goal_width = goal.pixels.width();
+                checkpoint.goal_height = goal.pixels.height();
+                checkpoint.goal_pixels = goal.pixels.to_vec();
+                let session_id = Some(persistence::save_session(
+                    &mut db,
+                    &checkpoint
+                ).expect("failed to create new session"));
+                
+                (session_id, None, Some(label), goal)
+            }
+            Ok(tui::TuiAction::Exit) => {
+                return;
+            }
+            Err(e) => {
+                eprintln!("TUI error: {}", e);
+                return;
+            }
+        }
     };
 
     // In windowed mode the device must be compatible with the window surface, so
@@ -165,10 +208,6 @@ fn main() {
     let observer = window_init
         .as_mut()
         .map(|w| &mut w.observer as &mut dyn es::StepObserver);
-    
-    // Get the label for the current session (if any)
-    let session_label = initial_state.as_ref().and_then(|cp| cp.label.clone())
-        .or(cli.label.clone());
     
     let result = es::run_es(device, queue, goal, cfg, observer, Some(&mut db), session_id, session_label);
     println!(

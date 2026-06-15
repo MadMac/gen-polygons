@@ -170,6 +170,18 @@ pub struct SessionSummary {
     pub steps_run: u64,
 }
 
+/// Helper to create a GoalImage from checkpoint data
+pub fn create_goal_image_from_checkpoint(checkpoint: &Checkpoint) -> crate::goal::GoalImage {
+    use image::{ImageBuffer, Rgba};
+    let pixels = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
+        checkpoint.goal_width,
+        checkpoint.goal_height,
+        checkpoint.goal_pixels.clone(),
+    )
+    .expect("Failed to create image buffer from checkpoint");
+    crate::goal::GoalImage { pixels }
+}
+
 // ============================================================================
 // Database Initialization
 // ============================================================================
