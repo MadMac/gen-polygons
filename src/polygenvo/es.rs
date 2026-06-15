@@ -5,6 +5,7 @@ use crate::fitness::{build_pyramid, FitnessCalc, LAMBDA};
 use crate::genome::{init_genome, Vertex, INITIAL_TRIANGLES, MAX_TRIANGLES};
 use crate::goal::GoalImage;
 use crate::gradient::{PolishCfg, PolishState};
+use crate::persistence;
 use crate::variation::{mutate, OpKind, StepSizes};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,6 +87,10 @@ pub(crate) struct EsConfig {
     // falls through to the normal final-snapshot/summary path.
     pub(crate) stop_flag: Option<Arc<AtomicBool>>,
     pub(crate) polish: PolishCfg,
+    // Persistence: save checkpoint every N accepted improvements (None = disabled)
+    pub(crate) checkpoint_interval: Option<u64>,
+    // Initial state to load from a previous session
+    pub(crate) initial_state: Option<crate::persistence::Checkpoint>,
 }
 
 impl EsConfig {
@@ -97,6 +102,8 @@ impl EsConfig {
             snapshot_every: Some(SNAPSHOT_EVERY_IMPROVEMENT),
             stop_flag: None,
             polish: PolishCfg::default(),
+            checkpoint_interval: None,
+            initial_state: None,
         }
     }
 }
@@ -337,15 +344,102 @@ fn snapshot_if(
     }
 }
 
+/// Extract the current ES state into a Checkpoint for saving.
+fn extract_state(
+    current: &[Vertex],
+    current_fitness: usize,
+    initial_fitness: usize,
+    step: u64,
+    improvements_total: u64,
+    schedule: &PhaseSchedule,
+    sigma: &OneFifthRule,
+    goal: &GoalImage,
+) -> persistence::Checkpoint {
+    persistence::Checkpoint {
+        session_id: None,
+        label: None,
+        goal_width: goal.pixels.width(),
+        goal_height: goal.pixels.height(),
+        goal_pixels: goal.pixels.to_vec(),
+        current_genome: current.to_vec(),
+        current_fitness: current_fitness as i64,
+        initial_fitness: initial_fitness as i64,
+        steps_run: step,
+        improvements_total,
+        phase_idx: schedule.idx,
+        phase_step: schedule.phase_step,
+        schedule_accepts: schedule.accepts,
+        sigma_pos: sigma.sigmas.pos,
+        sigma_col: sigma.sigmas.col,
+        sigma_grad: sigma.sigmas.grad,
+        window_steps: sigma.window_steps,
+        pos_gen: sigma.pos_gen,
+        pos_better: sigma.pos_better,
+        col_gen: sigma.col_gen,
+        col_better: sigma.col_better,
+        grad_gen: sigma.grad_gen,
+        grad_better: sigma.grad_better,
+    }
+}
+
+/// Initialize ES state from a loaded checkpoint.
+/// Re-scores the genome to get the error grid for the current phase.
+fn init_from_checkpoint(
+    checkpoint: &persistence::Checkpoint,
+    _goal: &GoalImage,
+    pyramid: &[FitnessCalc],
+    cfg: &EsConfig,
+) -> (PhaseSchedule, OneFifthRule, Vec<Vertex>, usize, Vec<u32>) {
+    // Reconstruct PhaseSchedule
+    let schedule = PhaseSchedule {
+        idx: checkpoint.phase_idx,
+        phase_step: checkpoint.phase_step,
+        accepts: checkpoint.schedule_accepts,
+    };
+
+    // Reconstruct OneFifthRule
+    let _phase = &cfg.phases[schedule.idx];
+    let sigma = OneFifthRule {
+        sigmas: StepSizes {
+            pos: checkpoint.sigma_pos,
+            col: checkpoint.sigma_col,
+            grad: checkpoint.sigma_grad,
+        },
+        window_steps: checkpoint.window_steps,
+        pos_gen: checkpoint.pos_gen,
+        pos_better: checkpoint.pos_better,
+        col_gen: checkpoint.col_gen,
+        col_better: checkpoint.col_better,
+        grad_gen: checkpoint.grad_gen,
+        grad_better: checkpoint.grad_better,
+    };
+
+    let current = checkpoint.current_genome.clone();
+
+    // Re-score to get the error grid for the current phase
+    let phase_level = cfg.phases[schedule.idx].pyramid_level;
+    let (current_fitness, parent_error_grid) =
+        score(&pyramid[phase_level], &current);
+
+    (schedule, sigma, current, current_fitness, parent_error_grid)
+}
+
 pub(crate) fn run_es(
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     goal: GoalImage,
     cfg: EsConfig,
     mut observer: Option<&mut dyn StepObserver>,
+    mut db_conn: Option<&mut rusqlite::Connection>,
+    session_id: Option<i64>,
 ) -> EsResult {
     let pyramid = build_pyramid(&device, &queue, &goal);
     let full_res = pyramid.len() - 1; // index of full-resolution level (for snapshots)
+
+    // Extract db_conn and session_id for use in the loop
+    // For checkpoint saving, we need a mutable reference to the connection
+    // and the session_id. We'll handle them separately to avoid move issues.
+    let session_id_for_checkpoint = session_id;
 
     // Optional gradient-polish state (built only when the flag is on). Polishes
     // against the full-resolution evaluator — the silhouette wall lives at 512².
@@ -354,16 +448,24 @@ pub(crate) fn run_es(
     let mut rng = rand::rng();
 
     // ---- Phase 0: initialise the genome (INITIAL_TRIANGLES, capped at phase 0's ceiling) ----
-    let mut schedule = PhaseSchedule::new();
-    let mut sigma = OneFifthRule::new(&cfg.phases[schedule.idx]);
-    let mut current = init_genome(
-        &goal,
-        INITIAL_TRIANGLES.min(cfg.phases[schedule.idx].cap),
-        &mut rng,
-    );
-    let (mut current_fitness, mut parent_error_grid) =
-        score(&pyramid[cfg.phases[schedule.idx].pyramid_level], &current);
-    let initial_fitness = current_fitness;
+    let (mut schedule, mut sigma, mut current, mut current_fitness, mut parent_error_grid, initial_fitness) =
+        if let Some(ref checkpoint) = cfg.initial_state {
+            // Load from checkpoint
+            let (sched, sig, curr, fit, err_grid) =
+                init_from_checkpoint(checkpoint, &goal, &pyramid, &cfg);
+            (sched, sig, curr, fit, err_grid, fit)
+        } else {
+            // Fresh start
+            let sched = PhaseSchedule::new();
+            let sig = OneFifthRule::new(&cfg.phases[sched.idx]);
+            let curr = init_genome(
+                &goal,
+                INITIAL_TRIANGLES.min(cfg.phases[sched.idx].cap),
+                &mut rng,
+            );
+            let (fit, err_grid) = score(&pyramid[cfg.phases[sched.idx].pyramid_level], &curr);
+            (sched, sig, curr, fit, err_grid, fit)
+        };
 
     log_phase(
         &format!("Phase {}", schedule.idx),
@@ -373,8 +475,21 @@ pub(crate) fn run_es(
         current_fitness,
     );
 
-    let mut step: u64 = 0;
-    let mut improvements_total: u64 = 0;
+    // Track checkpoint saving
+    let mut last_checkpoint_improvement: u64 = 0;
+    
+    // If loading from checkpoint, start from where we left off
+    // Otherwise start from 0
+    let mut step: u64 = if let Some(ref cp) = cfg.initial_state {
+        cp.steps_run
+    } else {
+        0
+    };
+    let mut improvements_total: u64 = if let Some(ref cp) = cfg.initial_state {
+        cp.improvements_total
+    } else {
+        0
+    };
     let started = Instant::now();
     let mut last_log = Instant::now();
 
@@ -446,6 +561,29 @@ pub(crate) fn run_es(
             current = candidates.swap_remove(i);
             current_fitness = best_fit;
             improvements_total += 1;
+
+            // Checkpoint saving: save state periodically
+            if let Some(interval) = cfg.checkpoint_interval
+                && improvements_total.is_multiple_of(interval)
+                && improvements_total != last_checkpoint_improvement
+            {
+                // Save checkpoint if we have both a database connection and session ID
+                if db_conn.is_some() && session_id_for_checkpoint.is_some() {
+                    // Use as_mut to get mutable access without moving
+                    if let Some(db) = db_conn.as_mut() {
+                        let checkpoint = extract_state(
+                            &current, current_fitness, initial_fitness, step,
+                            improvements_total, &schedule, &sigma, &goal
+                        );
+                        if let Err(e) = persistence::save_session(db, &checkpoint) {
+                            log::warn!("Failed to save checkpoint: {}", e);
+                        } else {
+                            last_checkpoint_improvement = improvements_total;
+                            log::info!("Checkpoint saved at improvement {}", improvements_total);
+                        }
+                    }
+                }
+            }
 
             // Periodic all-triangle gradient polish of the new best, gated by the
             // real ΔE2000 renderer (polish() keeps it only if it beats the parent
@@ -552,6 +690,24 @@ pub(crate) fn run_es(
         current_fitness
     );
     snapshot_if(&snapshot_dir, &pyramid[full_res], &current, "final.png");
+
+    // Save final checkpoint if DB is available
+    if db_conn.is_some() && session_id_for_checkpoint.is_some() {
+        if let (Some(db), Some(sid)) = (db_conn.as_mut(), session_id_for_checkpoint) {
+            let checkpoint = extract_state(
+                &current, current_fitness, initial_fitness, step,
+                improvements_total, &schedule, &sigma, &goal
+            );
+            // Set the session ID so we update the existing session
+            let mut checkpoint_with_id = checkpoint;
+            checkpoint_with_id.session_id = Some(sid);
+            if let Err(e) = persistence::save_session(db, &checkpoint_with_id) {
+                log::warn!("Failed to save final checkpoint: {}", e);
+            } else {
+                log::info!("Final checkpoint saved");
+            }
+        }
+    }
 
     EsResult {
         initial_fitness,
@@ -701,7 +857,11 @@ mod tests {
                 snapshot_every: None,
                 stop_flag: None,
                 polish: PolishCfg::default(),
+                checkpoint_interval: None,
+                initial_state: None,
             },
+            None,
+            None,
             None,
         );
         assert!(
@@ -758,8 +918,10 @@ mod tests {
             snapshot_every: None,
             stop_flag: None,
             polish: PolishCfg::default(),
+            checkpoint_interval: None,
+            initial_state: None,
         };
-        let base = run_es(device.clone(), queue.clone(), goal.clone(), cfg, None);
+        let base = run_es(device.clone(), queue.clone(), goal.clone(), cfg, None, None, None);
         let f_base = base.final_fitness;
         let mut g = base.final_genome;
         println!("PROBE baseline: {} tris, hard fitness {f_base}", g.len() / 3);

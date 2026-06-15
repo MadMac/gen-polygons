@@ -177,7 +177,7 @@ pub struct SessionSummary {
 /// Open or create the database at the given path.
 /// Enables WAL mode for better concurrency and sets appropriate pragmas.
 pub fn init_db(path: &Path) -> Result<rusqlite::Connection, PersistenceError> {
-    let mut conn = rusqlite::Connection::open_with_flags(
+    let conn = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
             | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
@@ -478,7 +478,7 @@ pub fn load_session(
     // Load session metadata
     let mut stmt = conn.prepare_cached(
         "SELECT 
-            id, label, created_at, updated_at,
+            id, label,
             goal_width, goal_height, goal_image_data,
             phase_index, phase_step,
             current_fitness, initial_fitness,
@@ -738,10 +738,10 @@ mod tests {
     fn test_save_load_roundtrip() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let conn = init_db(&db_path).unwrap();
+        let mut conn = init_db(&db_path).unwrap();
 
         let cp = create_test_checkpoint();
-        let id = save_session(&conn, &cp).unwrap();
+        let id = save_session(&mut conn, &cp).unwrap();
 
         let loaded = load_session(&conn, id).unwrap();
 
@@ -784,13 +784,13 @@ mod tests {
     fn test_list_sessions_ordered() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let conn = init_db(&db_path).unwrap();
+        let mut conn = init_db(&db_path).unwrap();
 
         // Save multiple sessions
         for i in 0..3 {
             let mut cp = create_test_checkpoint();
             cp.label = Some(format!("session {}", i));
-            save_session(&conn, &cp).unwrap();
+            save_session(&mut conn, &cp).unwrap();
             // Small delay to ensure different timestamps
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -808,16 +808,16 @@ mod tests {
     fn test_delete_session() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let conn = init_db(&db_path).unwrap();
+        let mut conn = init_db(&db_path).unwrap();
 
         let cp = create_test_checkpoint();
-        let id = save_session(&conn, &cp).unwrap();
+        let id = save_session(&mut conn, &cp).unwrap();
 
         // Verify it exists
         assert!(load_session(&conn, id).is_ok());
 
         // Delete it
-        delete_session(&conn, id).unwrap();
+        delete_session(&mut conn, id).unwrap();
 
         // Verify it's gone
         assert!(load_session(&conn, id).is_err());
@@ -827,9 +827,9 @@ mod tests {
     fn test_delete_nonexistent_session() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let conn = init_db(&db_path).unwrap();
+        let mut conn = init_db(&db_path).unwrap();
 
-        let result = delete_session(&conn, 999);
+        let result = delete_session(&mut conn, 999);
         assert!(matches!(result, Err(PersistenceError::SessionNotFound(999))));
     }
 

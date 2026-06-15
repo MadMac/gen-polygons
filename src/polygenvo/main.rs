@@ -52,6 +52,15 @@ struct Cli {
     gradient_polish: bool,
     /// `--goal <path>`: image to approximate. Defaults to goal.png.
     goal: String,
+    /// `--list-sessions`: list all saved sessions and exit.
+    list_sessions: bool,
+    /// `--load <id>`: load a saved session by ID and continue.
+    load: Option<i64>,
+    /// `--checkpoint-interval <n>`: auto-save every N accepted improvements.
+    /// 0 means disabled (default).
+    checkpoint_interval: Option<u64>,
+    /// `--label <text>`: label for a new session (when saving).
+    label: Option<String>,
 }
 
 impl Cli {
@@ -62,6 +71,10 @@ impl Cli {
             show_window: flag("--show-window"),
             gradient_polish: flag("--gradient-polish"),
             goal: arg_value("--goal").unwrap_or_else(|| "goal.png".to_string()),
+            list_sessions: flag("--list-sessions"),
+            load: arg_value("--load").and_then(|s| s.parse().ok()),
+            checkpoint_interval: arg_value("--checkpoint-interval").and_then(|s| s.parse().ok()),
+            label: arg_value("--label"),
         }
     }
 }
@@ -70,7 +83,50 @@ fn main() {
     env_logger::init();
 
     let cli = Cli::parse();
+
+    // Initialize database
+    let mut db = persistence::init_default_db().expect("failed to initialize database");
+
+    // Handle --list-sessions
+    if cli.list_sessions {
+        let sessions = persistence::list_sessions(&db).expect("failed to list sessions");
+        if sessions.is_empty() {
+            println!("No sessions found.");
+            return;
+        }
+        for s in sessions {
+            let label = s.label.as_deref().unwrap_or("<unnamed>");
+            let fitness_pct = (s.current_fitness as f64 / 1_000_000.0) * 100.0;
+            println!(
+                "ID: {}, Label: {}, Fitness: {:.2}%, Triangles: {}, Phase: {}, Steps: {}, Updated: {}",
+                s.id, label, fitness_pct, s.triangle_count, s.phase_index, s.steps_run, s.updated_at
+            );
+        }
+        return;
+    }
+
+    // Load goal image
     let goal = goal::load_goal_image(&cli.goal);
+
+    // Load session if requested
+    let initial_state = cli.load.map(|id| {
+        persistence::load_session(&mut db, id).expect("failed to load session")
+    });
+
+    // Get or create session ID for saving
+    let session_id = if let Some(ref cp) = initial_state {
+        // Loading existing session - use its ID
+        cp.session_id
+    } else if cli.checkpoint_interval.is_some() || cli.label.is_some() {
+        // Creating new session - create entry now with label
+        Some(persistence::save_session(
+            &mut db,
+            &persistence::Checkpoint::new(cli.label.clone())
+        ).expect("failed to create new session"))
+    } else {
+        // No persistence requested
+        None
+    };
 
     // In windowed mode the device must be compatible with the window surface, so
     // `window::init_window` brings up both the window and the device together;
@@ -87,6 +143,9 @@ fn main() {
     if cli.gradient_polish {
         println!("Gradient polish enabled (every {} accepted improvements).", cfg.polish.every_k);
     }
+    cfg.checkpoint_interval = cli.checkpoint_interval;
+    cfg.initial_state = initial_state.clone();
+    
     if cli.infinite {
         let stop = Arc::new(AtomicBool::new(false));
         cfg.max_steps = u64::MAX;
@@ -102,7 +161,8 @@ fn main() {
     let observer = window_init
         .as_mut()
         .map(|w| &mut w.observer as &mut dyn es::StepObserver);
-    let result = es::run_es(device, queue, goal, cfg, observer);
+    
+    let result = es::run_es(device, queue, goal, cfg, observer, Some(&mut db), session_id);
     println!(
         "Done. Initial fitness: {}, final fitness: {}, steps: {}",
         result.initial_fitness, result.final_fitness, result.steps_run
