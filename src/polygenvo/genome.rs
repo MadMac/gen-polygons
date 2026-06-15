@@ -86,6 +86,7 @@ pub(crate) fn seeded_triangle(
 }
 
 pub(crate) fn init_genome(goal: &GoalImage, n_triangles: usize, rng: &mut impl Rng) -> Vec<Vertex> {
+    let n_triangles = n_triangles.min(MAX_TRIANGLES);
     let mut genome = Vec::with_capacity(n_triangles * 3);
     for _ in 0..n_triangles {
         let cx = rng.random_range(-0.9_f32..0.9);
