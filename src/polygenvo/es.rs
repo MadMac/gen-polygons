@@ -514,8 +514,8 @@ pub(crate) fn run_es(
     }
 
     while step < cfg.max_steps {
-        // Graceful stop (e.g. Ctrl-C in `--infinite` mode): leave the loop at a
-        // step boundary so the final snapshot and summary below still run.
+        // Graceful stop (e.g. Ctrl-C): leave the loop at a step boundary so the
+        // final snapshot and summary below still run.
         if cfg.stop_flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
             println!("Stop requested — halting at step {step}.");
             break;

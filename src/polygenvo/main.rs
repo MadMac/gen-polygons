@@ -212,15 +212,17 @@ fn main() {
     cfg.checkpoint_interval = cli.checkpoint_interval;
     cfg.initial_state = initial_state.clone();
     
+    // Always set up Ctrl+C handler for graceful shutdown with session saving
+    let stop = Arc::new(AtomicBool::new(false));
+    cfg.stop_flag = Some(stop.clone());
+    ctrlc::set_handler(move || {
+        eprintln!("\nCtrl-C received — finishing the current step, then stopping…");
+        stop.store(true, Ordering::Relaxed);
+    })
+    .expect("failed to install Ctrl-C handler");
+
     if cli.infinite {
-        let stop = Arc::new(AtomicBool::new(false));
         cfg.max_steps = u64::MAX;
-        cfg.stop_flag = Some(stop.clone());
-        ctrlc::set_handler(move || {
-            eprintln!("\nCtrl-C received — finishing the current step, then stopping…");
-            stop.store(true, Ordering::Relaxed);
-        })
-        .expect("failed to install Ctrl-C handler");
         println!("Running in --infinite mode; press Ctrl-C to stop.");
     }
 
