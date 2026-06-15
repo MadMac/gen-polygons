@@ -234,8 +234,8 @@ fn check_schema_version(conn: &rusqlite::Connection) -> Result<(), PersistenceEr
 /// Validate a checkpoint before saving or after loading.
 /// Returns error if any field is invalid.
 pub fn validate_checkpoint(checkpoint: &Checkpoint) -> Result<(), PersistenceError> {
-    // Genome must have 3N vertices (N triangles)
-    if checkpoint.current_genome.len() % 3 != 0 {
+    // Genome must have 3N vertices (N triangles) - empty is allowed for new sessions
+    if checkpoint.current_genome.len() % 3 != 0 && !checkpoint.current_genome.is_empty() {
         return Err(PersistenceError::InvalidCheckpoint(format!(
             "genome has {} vertices (not multiple of 3)",
             checkpoint.current_genome.len()

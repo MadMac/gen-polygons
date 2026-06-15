@@ -354,10 +354,11 @@ fn extract_state(
     schedule: &PhaseSchedule,
     sigma: &OneFifthRule,
     goal: &GoalImage,
+    label: Option<String>,
 ) -> persistence::Checkpoint {
     persistence::Checkpoint {
         session_id: None,
-        label: None,
+        label,
         goal_width: goal.pixels.width(),
         goal_height: goal.pixels.height(),
         goal_pixels: goal.pixels.to_vec(),
@@ -432,14 +433,16 @@ pub(crate) fn run_es(
     mut observer: Option<&mut dyn StepObserver>,
     mut db_conn: Option<&mut rusqlite::Connection>,
     session_id: Option<i64>,
+    session_label: Option<String>,
 ) -> EsResult {
     let pyramid = build_pyramid(&device, &queue, &goal);
     let full_res = pyramid.len() - 1; // index of full-resolution level (for snapshots)
 
-    // Extract db_conn and session_id for use in the loop
+    // Extract db_conn, session_id, and session_label for use in the loop
     // For checkpoint saving, we need a mutable reference to the connection
     // and the session_id. We'll handle them separately to avoid move issues.
     let session_id_for_checkpoint = session_id;
+    let session_label_for_checkpoint = session_label;
 
     // Optional gradient-polish state (built only when the flag is on). Polishes
     // against the full-resolution evaluator — the silhouette wall lives at 512².
@@ -571,10 +574,12 @@ pub(crate) fn run_es(
                 if db_conn.is_some() && session_id_for_checkpoint.is_some() {
                     // Use as_mut to get mutable access without moving
                     if let Some(db) = db_conn.as_mut() {
-                        let checkpoint = extract_state(
+                        let mut checkpoint = extract_state(
                             &current, current_fitness, initial_fitness, step,
-                            improvements_total, &schedule, &sigma, &goal
+                            improvements_total, &schedule, &sigma, &goal,
+                            session_label_for_checkpoint.clone()
                         );
+                        checkpoint.session_id = session_id_for_checkpoint;
                         if let Err(e) = persistence::save_session(db, &checkpoint) {
                             log::warn!("Failed to save checkpoint: {}", e);
                         } else {
@@ -696,7 +701,8 @@ pub(crate) fn run_es(
         if let (Some(db), Some(sid)) = (db_conn.as_mut(), session_id_for_checkpoint) {
             let checkpoint = extract_state(
                 &current, current_fitness, initial_fitness, step,
-                improvements_total, &schedule, &sigma, &goal
+                improvements_total, &schedule, &sigma, &goal,
+                session_label_for_checkpoint.clone()
             );
             // Set the session ID so we update the existing session
             let mut checkpoint_with_id = checkpoint;
@@ -863,6 +869,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             result.steps_run > 0,
@@ -921,7 +928,7 @@ mod tests {
             checkpoint_interval: None,
             initial_state: None,
         };
-        let base = run_es(device.clone(), queue.clone(), goal.clone(), cfg, None, None, None);
+        let base = run_es(device.clone(), queue.clone(), goal.clone(), cfg, None, None, None, None);
         let f_base = base.final_fitness;
         let mut g = base.final_genome;
         println!("PROBE baseline: {} tris, hard fitness {f_base}", g.len() / 3);

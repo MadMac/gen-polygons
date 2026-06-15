@@ -118,10 +118,14 @@ fn main() {
         // Loading existing session - use its ID
         cp.session_id
     } else if cli.checkpoint_interval.is_some() || cli.label.is_some() {
-        // Creating new session - create entry now with label
+        // Creating new session - create entry now with label and goal info
+        let mut checkpoint = persistence::Checkpoint::new(cli.label.clone());
+        checkpoint.goal_width = goal.pixels.width();
+        checkpoint.goal_height = goal.pixels.height();
+        checkpoint.goal_pixels = goal.pixels.to_vec();
         Some(persistence::save_session(
             &mut db,
-            &persistence::Checkpoint::new(cli.label.clone())
+            &checkpoint
         ).expect("failed to create new session"))
     } else {
         // No persistence requested
@@ -162,7 +166,11 @@ fn main() {
         .as_mut()
         .map(|w| &mut w.observer as &mut dyn es::StepObserver);
     
-    let result = es::run_es(device, queue, goal, cfg, observer, Some(&mut db), session_id);
+    // Get the label for the current session (if any)
+    let session_label = initial_state.as_ref().and_then(|cp| cp.label.clone())
+        .or(cli.label.clone());
+    
+    let result = es::run_es(device, queue, goal, cfg, observer, Some(&mut db), session_id, session_label);
     println!(
         "Done. Initial fitness: {}, final fitness: {}, steps: {}",
         result.initial_fitness, result.final_fitness, result.steps_run
