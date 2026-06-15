@@ -114,6 +114,35 @@ performance follow-up for the fitness shader).
 
 ## Status
 
-A personal experiment, not a polished tool — no CLI flags or configuration files yet;
-behaviour is changed by editing the constants above. Substantive changes are validated
-by running it and eyeballing the frames in `triangles/`.
+A personal experiment, not a polished tool — limited CLI flags for basic configuration;
+behaviour is primarily changed by editing the constants in the source files. Substantive
+changes are validated by running it and eyeballing the frames in `triangles/`.
+
+## CLI parameters
+
+`polygenvo` accepts the following command-line arguments:
+
+| Flag | Description |
+|---|---|
+| `--infinite` | Run until Ctrl-C (drops the MAX_STEPS ceiling) |
+| `--show-window` | Open a live window that renders the current best candidate as the run progresses |
+| `--gradient-polish` | Enable gradient polishing: every N accepted improvements, polish all triangle positions and colors using on-device gradient descent |
+| `--goal <path>` | Path to the target image to approximate (defaults to `goal.png` in the working directory) |
+
+Examples:
+```sh
+# Run with default settings
+cargo run --release --bin polygenvo
+
+# Run with a custom target image
+cargo run --release --bin polygenvo --goal my_image.png
+
+# Run with live preview window
+cargo run --release --bin polygenvo --show-window
+
+# Run indefinitely until Ctrl-C
+cargo run --release --bin polygenvo --infinite
+
+# Combine flags
+cargo run --release --bin polygenvo --show-window --gradient-polish --goal custom.png
+```
