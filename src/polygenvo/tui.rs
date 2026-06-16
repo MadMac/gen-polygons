@@ -17,16 +17,42 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Padding, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Padding},
     Terminal,
 };
+use tui_input::Input;
+use tui_input::backend::crossterm::to_input_request;
 use std::io::{self, stdout, Stdout};
+
+/// Configuration for a new session
+#[derive(Debug, Clone)]
+pub struct NewSessionConfig {
+    /// Session label/name
+    pub label: String,
+    /// Path to the goal image (default: "goal.png")
+    pub goal: String,
+    /// Run until Ctrl-C (default: false)
+    pub infinite: bool,
+    /// Open live window (default: false)
+    pub show_window: bool,
+}
+
+impl Default for NewSessionConfig {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            goal: "goal.png".to_string(),
+            infinite: false,
+            show_window: false,
+        }
+    }
+}
 
 /// Action to perform after TUI exits
 #[derive(Debug, Clone)]
 pub enum TuiAction {
-    /// Run a new session with the given label
-    NewSession { label: String },
+    /// Run a new session with the given configuration
+    NewSession(NewSessionConfig),
     /// Resume the session with the given ID
     ResumeSession { id: i64 },
     /// Delete the session with the given ID
@@ -54,7 +80,7 @@ pub fn run_tui(db_conn: &mut rusqlite::Connection) -> io::Result<TuiAction> {
         Ok(s) => s,
         Err(_) => {
             cleanup_terminal(&mut terminal)?;
-            return Ok(TuiAction::NewSession { label: "default".to_string() });
+            return Ok(TuiAction::NewSession(NewSessionConfig::default()));
         }
     };
 
@@ -63,7 +89,10 @@ pub fn run_tui(db_conn: &mut rusqlite::Connection) -> io::Result<TuiAction> {
         sessions: sessions.clone(),
         list_state: ListState::default().with_selected(Some(0)),
         mode: Mode::SessionSelect,
-        new_session_label: String::new(),
+        new_session_config: NewSessionConfig::default(),
+        new_session_label_input: Input::new("".to_string()),
+        new_session_goal_input: Input::new("goal.png".to_string()),
+        new_session_active_field: ActiveField::Label,
         session_to_delete: None,
     };
 
@@ -113,26 +142,64 @@ pub fn run_tui(db_conn: &mut rusqlite::Connection) -> io::Result<TuiAction> {
                     }
                 }
                 Mode::NewSession => {
+                    // Handle field navigation first
                     match key.code {
-                        KeyCode::Char(c) => {
-                            app.new_session_label.push(c);
+                        KeyCode::Tab => {
+                            app.new_session_active_field = app.new_session_active_field.next();
                         }
-                        KeyCode::Backspace => {
-                            app.new_session_label.pop();
+                        KeyCode::BackTab => {
+                            app.new_session_active_field = app.new_session_active_field.prev();
+                        }
+                        KeyCode::Down => {
+                            app.new_session_active_field = app.new_session_active_field.next();
+                        }
+                        KeyCode::Up => {
+                            app.new_session_active_field = app.new_session_active_field.prev();
+                        }
+                        KeyCode::Char(' ') => {
+                            // Toggle boolean fields
+                            match app.new_session_active_field {
+                                ActiveField::Infinite => {
+                                    app.new_session_config.infinite = !app.new_session_config.infinite;
+                                }
+                                ActiveField::ShowWindow => {
+                                    app.new_session_config.show_window = !app.new_session_config.show_window;
+                                }
+                                _ => {}
+                            }
                         }
                         KeyCode::Enter => {
-                            if !app.new_session_label.is_empty() {
+                            let label = app.new_session_label_input.value();
+                            if !label.is_empty() {
+                                // Sync the input values to the config
+                                app.new_session_config.label = label.to_string();
+                                app.new_session_config.goal = app.new_session_goal_input.value().to_string();
+                                
                                 cleanup_terminal(&mut terminal)?;
-                                return Ok(TuiAction::NewSession {
-                                    label: app.new_session_label.clone(),
-                                });
+                                return Ok(TuiAction::NewSession(app.new_session_config.clone()));
                             }
                         }
                         KeyCode::Esc => {
                             app.mode = Mode::SessionSelect;
-                            app.new_session_label.clear();
+                            app.new_session_label_input = Input::new("".to_string());
+                            app.new_session_goal_input = Input::new("goal.png".to_string());
+                            app.new_session_config = NewSessionConfig::default();
+                            app.new_session_active_field = ActiveField::Label;
                         }
-                        _ => {}
+                        _ => {
+                            // Handle text input for active text fields using tui-input
+                            if let Some(request) = to_input_request(&CrosstermEvent::Key(key)) {
+                                match app.new_session_active_field {
+                                    ActiveField::Label => {
+                                        app.new_session_label_input.handle(request);
+                                    }
+                                    ActiveField::Goal => {
+                                        app.new_session_goal_input.handle(request);
+                                    }
+                                    ActiveField::Infinite | ActiveField::ShowWindow => {}
+                                }
+                            }
+                        }
                     }
                 }
                 Mode::ConfirmDelete => {
@@ -171,7 +238,10 @@ struct App {
     sessions: Vec<SessionSummary>,
     list_state: ListState,
     mode: Mode,
-    new_session_label: String,
+    new_session_config: NewSessionConfig,
+    new_session_label_input: Input,
+    new_session_goal_input: Input,
+    new_session_active_field: ActiveField,
     session_to_delete: Option<i64>,
 }
 
@@ -181,6 +251,35 @@ enum Mode {
     SessionSelect,
     NewSession,
     ConfirmDelete,
+}
+
+/// Fields in the new session configuration screen
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveField {
+    Label,
+    Goal,
+    Infinite,
+    ShowWindow,
+}
+
+impl ActiveField {
+    fn next(self) -> Self {
+        match self {
+            ActiveField::Label => ActiveField::Goal,
+            ActiveField::Goal => ActiveField::Infinite,
+            ActiveField::Infinite => ActiveField::ShowWindow,
+            ActiveField::ShowWindow => ActiveField::Label,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            ActiveField::Label => ActiveField::ShowWindow,
+            ActiveField::Goal => ActiveField::Label,
+            ActiveField::Infinite => ActiveField::Goal,
+            ActiveField::ShowWindow => ActiveField::Infinite,
+        }
+    }
 }
 
 /// UI rendering
@@ -245,48 +344,150 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
             });
         }
         Mode::NewSession => {
-            // Create a centered block for new session input
+            // Create a centered block for new session configuration
             let block = Block::default()
-                .title("New Session")
-                .borders(Borders::ALL)
-                .padding(Padding::new(2, 2, 2, 2));
+                .title("New Session Configuration")
+                .borders(Borders::ALL);
 
-            let area = centered_rect(60, 10, size);
+            // Calculate dialog size
+            let desired_width = 40;
+            let desired_height = 8;
+            
+            let width_percent = if size.width > desired_width {
+                std::cmp::min(((desired_width * 100) / size.width) as u16, 80)
+            } else {
+                85
+            };
+            let height_percent = if size.height > desired_height {
+                std::cmp::min(((desired_height * 100) / size.height) as u16, 40)
+            } else {
+                35
+            };
+            
+            let area = centered_rect(width_percent, height_percent, size);
             f.render_widget(Clear, area);
             f.render_widget(block, area);
 
-            // Input field
-            let input = Paragraph::new(app.new_session_label.as_str())
-                .block(
-                    Block::default()
-                        .title("Session Label")
-                        .borders(Borders::ALL),
-                )
-                .wrap(Wrap { trim: false });
-
+            // Calculate inner area
             let inner_area = Rect {
-                x: area.x + 2,
-                y: area.y + 2,
-                width: area.width - 4,
-                height: 3,
+                x: area.x + 1,
+                y: area.y + 1,
+                width: area.width.saturating_sub(2),
+                height: area.height.saturating_sub(2),
             };
-            f.render_widget(input, inner_area);
 
-            // Instructions
+            // Field positioning
+            let field_height = 1;
+            let line_spacing = 0;
+
+            // Render label input with prefix
+            let label_rect = Rect {
+                x: inner_area.x,
+                y: inner_area.y,
+                width: inner_area.width,
+                height: field_height,
+            };
+            
+            let label_style = if app.new_session_active_field == ActiveField::Label {
+                Style::new().fg(ratatui::style::Color::Yellow)
+            } else {
+                Style::new()
+            };
+            
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Label: ", label_style),
+                ])),
+                label_rect
+            );
+            // Render label input with cursor
+            let label_text = app.new_session_label_input.value();
+            let label_cursor = app.new_session_label_input.cursor();
+            let label_display = render_input_field("Label: ", label_text, label_cursor, app.new_session_active_field == ActiveField::Label);
+            f.render_widget(Paragraph::new(label_display), label_rect);
+
+            // Render goal input with cursor
+            let goal_rect = Rect {
+                x: inner_area.x,
+                y: inner_area.y + field_height + line_spacing,
+                width: inner_area.width,
+                height: field_height,
+            };
+            
+            let goal_text = app.new_session_goal_input.value();
+            let goal_cursor = app.new_session_goal_input.cursor();
+            let goal_display = render_input_field("Goal: ", goal_text, goal_cursor, app.new_session_active_field == ActiveField::Goal);
+            f.render_widget(Paragraph::new(goal_display), goal_rect);
+
+            // Render boolean fields
+            let bool_style = |is_active: bool| {
+                if is_active {
+                    Style::new().fg(ratatui::style::Color::Yellow).underlined()
+                } else {
+                    Style::new()
+                }
+            };
+
+            let infinite_rect = Rect {
+                x: inner_area.x,
+                y: inner_area.y + (field_height + line_spacing) * 2,
+                width: inner_area.width,
+                height: field_height,
+            };
+            let checkbox = if app.new_session_config.infinite { "[✓]" } else { "[ ]" };
+            let cursor = if app.new_session_active_field == ActiveField::Infinite { "▋" } else { "" };
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(checkbox),
+                    Span::raw(" "),
+                    Span::styled("Infinite Mode", bool_style(app.new_session_active_field == ActiveField::Infinite)),
+                    Span::raw(cursor),
+                ])),
+                infinite_rect
+            );
+
+            let window_rect = Rect {
+                x: inner_area.x,
+                y: inner_area.y + (field_height + line_spacing) * 3,
+                width: inner_area.width,
+                height: field_height,
+            };
+            let checkbox = if app.new_session_config.show_window { "[✓]" } else { "[ ]" };
+            let cursor = if app.new_session_active_field == ActiveField::ShowWindow { "▋" } else { "" };
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(checkbox),
+                    Span::raw(" "),
+                    Span::styled("Show Window", bool_style(app.new_session_active_field == ActiveField::ShowWindow)),
+                    Span::raw(cursor),
+                ])),
+                window_rect
+            );
+
+            // Instructions at the bottom
+            let instructions_rect = Rect {
+                x: inner_area.x,
+                y: inner_area.y + (field_height + line_spacing) * 4,
+                width: inner_area.width,
+                height: 1,
+            };
             let instructions = Paragraph::new(vec![
                 Line::from(vec![
-                    Span::raw("Enter: Create  "),
-                    Span::raw("Esc: Cancel"),
+                    Span::raw("↑/↓:"),
+                    Span::styled("Navigate", Style::new().fg(ratatui::style::Color::Green)),
+                    Span::raw(" | Tab:"),
+                    Span::styled("Next", Style::new().fg(ratatui::style::Color::Green)),
+                    Span::raw(" | Shift+Tab:"),
+                    Span::styled("Prev", Style::new().fg(ratatui::style::Color::Green)),
+                    Span::raw(" | Space:"),
+                    Span::styled("Toggle", Style::new().fg(ratatui::style::Color::Green)),
+                    Span::raw(" | Enter:"),
+                    Span::styled("Create", Style::new().fg(ratatui::style::Color::Green)),
+                    Span::raw(" | Esc:"),
+                    Span::styled("Cancel", Style::new().fg(ratatui::style::Color::Red)),
                 ]),
-            ])
-            .block(Block::default());
-
-            f.render_widget(instructions, Rect {
-                x: area.x,
-                y: area.y + area.height - 1,
-                width: area.width,
-                height: 1,
-            });
+            ]);
+            f.render_widget(instructions, instructions_rect);
         }
         Mode::ConfirmDelete => {
             // Create a centered confirmation dialog
@@ -342,6 +543,79 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
         }
     }
 }
+
+/// Helper function to render an input field with cursor at the right position
+fn render_input_field<'a>(prefix: &'a str, value: &'a str, cursor_pos: usize, is_active: bool) -> Line<'a> {
+    let prefix_style = if is_active {
+        Style::new().fg(ratatui::style::Color::Yellow).underlined()
+    } else {
+        Style::new()
+    };
+    
+    let mut spans = vec![
+        Span::styled(prefix, prefix_style),
+    ];
+    
+    // Add the value text with cursor
+    let chars: Vec<char> = value.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        spans.push(Span::raw(c.to_string()));
+        // Insert cursor after this character if we're at the cursor position
+        if is_active && i + 1 == cursor_pos {
+            spans.push(Span::raw("▋").fg(ratatui::style::Color::Yellow));
+        }
+    }
+    
+    // If cursor is at the end, add it after all content
+    if is_active && cursor_pos == chars.len() {
+        spans.push(Span::raw("▋").fg(ratatui::style::Color::Yellow));
+    }
+    
+    Line::from(spans)
+}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_new_session_config_default() {
+            let config = NewSessionConfig::default();
+            
+            assert_eq!(config.label, "");
+            assert_eq!(config.goal, "goal.png");
+            assert!(!config.infinite);
+            assert!(!config.show_window);
+        }
+
+        #[test]
+        fn test_active_field_navigation() {
+            assert_eq!(ActiveField::Label.next(), ActiveField::Goal);
+            assert_eq!(ActiveField::Goal.next(), ActiveField::Infinite);
+            assert_eq!(ActiveField::Infinite.next(), ActiveField::ShowWindow);
+            assert_eq!(ActiveField::ShowWindow.next(), ActiveField::Label);
+
+            assert_eq!(ActiveField::Label.prev(), ActiveField::ShowWindow);
+            assert_eq!(ActiveField::Goal.prev(), ActiveField::Label);
+            assert_eq!(ActiveField::Infinite.prev(), ActiveField::Goal);
+            assert_eq!(ActiveField::ShowWindow.prev(), ActiveField::Infinite);
+        }
+
+        #[test]
+        fn test_new_session_config_with_custom_values() {
+            let config = NewSessionConfig {
+                label: "My Session".to_string(),
+                goal: "custom_goal.png".to_string(),
+                infinite: true,
+                show_window: true,
+            };
+            
+            assert_eq!(config.label, "My Session");
+            assert_eq!(config.goal, "custom_goal.png");
+            assert!(config.infinite);
+            assert!(config.show_window);
+        }
+    }
 
 /// Helper to create a centered rectangle
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

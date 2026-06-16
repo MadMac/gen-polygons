@@ -120,7 +120,7 @@ fn main() {
 
     // Determine if we should use TUI or CLI-only mode
     // Use TUI if no explicit session selection or creation flags are provided
-    let (session_id, initial_state, session_label, goal) = if cli.load.is_some() || cli.checkpoint_interval.is_some() || cli.label.is_some() {
+    let (session_id, initial_state, session_label, goal, tui_config) = if cli.load.is_some() || cli.checkpoint_interval.is_some() || cli.label.is_some() {
         // CLI mode - user specified explicit options
         let goal = goal::load_goal_image(&cli.goal);
         
@@ -152,7 +152,7 @@ fn main() {
         let session_label = initial_state.as_ref().and_then(|cp| cp.label.clone())
             .or(cli.label.clone());
         
-        (session_id, initial_state, session_label, goal)
+        (session_id, initial_state, session_label, goal, None)
     } else {
         // TUI mode - run the TUI to select or create a session
         match tui::run_tui(&mut db) {
@@ -160,13 +160,15 @@ fn main() {
                 let checkpoint = persistence::load_session(&mut db, id).expect("failed to load session");
                 let goal = persistence::create_goal_image_from_checkpoint(&checkpoint);
                 let session_label = checkpoint.label.clone();
-                (Some(id), Some(checkpoint), session_label, goal)
+                (Some(id), Some(checkpoint), session_label, goal, None)
             }
-            Ok(tui::TuiAction::NewSession { label }) => {
-                let goal = goal::load_goal_image(&cli.goal);
+            Ok(tui::TuiAction::NewSession(config)) => {
+                // Use the goal from config if specified, otherwise fall back to CLI goal
+                let goal_path = if config.goal.is_empty() { &cli.goal } else { &config.goal };
+                let goal = goal::load_goal_image(goal_path);
                 
                 // Create new session
-                let mut checkpoint = persistence::Checkpoint::new(Some(label.clone()));
+                let mut checkpoint = persistence::Checkpoint::new(Some(config.label.clone()));
                 checkpoint.goal_width = goal.pixels.width();
                 checkpoint.goal_height = goal.pixels.height();
                 checkpoint.goal_pixels = goal.pixels.to_vec();
@@ -175,7 +177,7 @@ fn main() {
                     &checkpoint
                 ).expect("failed to create new session"));
                 
-                (session_id, None, Some(label), goal)
+                (session_id, None, Some(config.label.clone()), goal, Some(config))
             }
             Ok(tui::TuiAction::DeleteSession { id }) => {
                 match persistence::delete_session(&mut db, id) {
@@ -194,11 +196,15 @@ fn main() {
         }
     };
 
+    // Use TUI config if available, otherwise use CLI config
+    let effective_show_window = tui_config.as_ref().map(|c| c.show_window).unwrap_or(cli.show_window);
+    let effective_infinite = tui_config.as_ref().map(|c| c.infinite).unwrap_or(cli.infinite);
+
     // In windowed mode the device must be compatible with the window surface, so
     // `window::init_window` brings up both the window and the device together;
     // the headless path keeps using `gpu::init_wgpu`. Either way the ES and the
     // viewer share one device/queue.
-    let mut window_init = cli.show_window.then(|| window::init_window(goal.pixels.width()));
+    let mut window_init = effective_show_window.then(|| window::init_window(goal.pixels.width()));
     let (device, queue) = match &window_init {
         Some(w) => (w.device.clone(), w.queue.clone()),
         None => block_on(gpu::init_wgpu()),
@@ -221,7 +227,7 @@ fn main() {
     })
     .expect("failed to install Ctrl-C handler");
 
-    if cli.infinite {
+    if effective_infinite {
         cfg.max_steps = u64::MAX;
         println!("Running in --infinite mode; press Ctrl-C to stop.");
     }
