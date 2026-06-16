@@ -349,19 +349,20 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
                 .title("New Session Configuration")
                 .borders(Borders::ALL);
 
-            // Calculate dialog size
-            let desired_width = 40;
-            let desired_height = 8;
+            // Calculate dialog size - we need space for "Infinite Mode" (14 chars) + "Show Window" (12 chars)
+            // plus prefixes and some padding, so minimum ~50 chars
+            let min_width = 50;
+            let min_height = 7;
             
-            let width_percent = if size.width > desired_width {
-                std::cmp::min(((desired_width * 100) / size.width) as u16, 80)
+            let width_percent = if size.width > min_width {
+                std::cmp::max(((min_width * 100) / size.width) as u16, 40) // At least 40% width
             } else {
-                85
+                85 // Use 85% for smaller terminals
             };
-            let height_percent = if size.height > desired_height {
-                std::cmp::min(((desired_height * 100) / size.height) as u16, 40)
+            let height_percent = if size.height > min_height {
+                std::cmp::min(((min_height * 100) / size.height) as u16, 30) // Max 30% height
             } else {
-                35
+                35 // Use 35% for smaller terminals
             };
             
             let area = centered_rect(width_percent, height_percent, size);
