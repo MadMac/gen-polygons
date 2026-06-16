@@ -349,27 +349,14 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
                 .title("New Session Configuration")
                 .borders(Borders::ALL);
 
-            // Calculate dialog size - we need space for "Infinite Mode" (14 chars) + "Show Window" (12 chars)
-            // plus prefixes and some padding, so minimum ~50 chars
-            let min_width = 50;
-            let min_height = 7;
-            
-            let width_percent = if size.width > min_width {
-                std::cmp::max(((min_width * 100) / size.width) as u16, 40) // At least 40% width
-            } else {
-                85 // Use 85% for smaller terminals
-            };
-            let height_percent = if size.height > min_height {
-                std::cmp::min(((min_height * 100) / size.height) as u16, 30) // Max 30% height
-            } else {
-                35 // Use 35% for smaller terminals
-            };
-            
-            let area = centered_rect(width_percent, height_percent, size);
+            // Use a simpler approach: fixed percentage that should work well
+            // We need space for "Infinite Mode" and "Show Window" plus prefixes
+            // Let's use 60% width and 20% height for a good balance
+            let area = centered_rect(60, 20, size);
             f.render_widget(Clear, area);
             f.render_widget(block, area);
 
-            // Calculate inner area
+            // Calculate inner area with padding
             let inner_area = Rect {
                 x: area.x + 1,
                 y: area.y + 1,
@@ -377,9 +364,9 @@ fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
                 height: area.height.saturating_sub(2),
             };
 
-            // Field positioning
+            // Field positioning - ensure each field has enough space
             let field_height = 1;
-            let line_spacing = 0;
+            let line_spacing = 1; // Add spacing between fields
 
             // Render label input with prefix
             let label_rect = Rect {
