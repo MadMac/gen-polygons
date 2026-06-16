@@ -13,7 +13,7 @@ pub(crate) fn make_checker_goal(size: u32) -> GoalImage {
     let cell = (size / 4).max(1); // 4×4 logical cells; min 1px
     for y in 0..size {
         for x in 0..size {
-            let on = ((x / cell) + (y / cell)) % 2 == 0;
+            let on = ((x / cell) + (y / cell)).is_multiple_of(2);
             let v = if on { 255 } else { 0 };
             buf.put_pixel(x, y, Rgba([v, v, v, 255]));
         }

@@ -14,6 +14,7 @@ use crate::genome::Vertex;
 use thiserror::Error;
 
 /// Schema version for future migrations
+#[allow(dead_code)]
 const SCHEMA_VERSION: u32 = 1;
 
 /// SQL for creating database tables
@@ -77,6 +78,7 @@ pub enum PersistenceError {
 
     /// Database schema version mismatch
     #[error("Schema version mismatch: expected {0}, got {1}")]
+    #[allow(dead_code)]
     SchemaVersionMismatch(u32, u32),
 }
 
@@ -160,9 +162,12 @@ impl Checkpoint {
 pub struct SessionSummary {
     pub id: i64,
     pub label: Option<String>,
+    #[allow(dead_code)]
     pub created_at: String,
     pub updated_at: String,
+    #[allow(dead_code)]
     pub goal_width: u32,
+    #[allow(dead_code)]
     pub goal_height: u32,
     pub current_fitness: i64,
     pub triangle_count: usize,
@@ -213,6 +218,7 @@ pub fn init_db(path: &Path) -> Result<rusqlite::Connection, PersistenceError> {
 }
 
 /// Check and validate schema version.
+#[allow(dead_code)]
 fn check_schema_version(conn: &rusqlite::Connection) -> Result<(), PersistenceError> {
     let version: u32 = conn
         .query_row(
@@ -222,11 +228,7 @@ fn check_schema_version(conn: &rusqlite::Connection) -> Result<(), PersistenceEr
         )
         .map_err(|e| {
             // If table doesn't exist, we have a fresh DB which is fine
-            if e.to_string().contains("no such table") {
-                PersistenceError::Database(e)
-            } else {
-                PersistenceError::Database(e)
-            }
+            PersistenceError::Database(e)
         })?;
 
     if version != SCHEMA_VERSION {
@@ -247,7 +249,7 @@ fn check_schema_version(conn: &rusqlite::Connection) -> Result<(), PersistenceEr
 /// Returns error if any field is invalid.
 pub fn validate_checkpoint(checkpoint: &Checkpoint) -> Result<(), PersistenceError> {
     // Genome must have 3N vertices (N triangles) - empty is allowed for new sessions
-    if checkpoint.current_genome.len() % 3 != 0 && !checkpoint.current_genome.is_empty() {
+    if !checkpoint.current_genome.len().is_multiple_of(3) && !checkpoint.current_genome.is_empty() {
         return Err(PersistenceError::InvalidCheckpoint(format!(
             "genome has {} vertices (not multiple of 3)",
             checkpoint.current_genome.len()
@@ -603,7 +605,7 @@ pub fn list_sessions(conn: &rusqlite::Connection) -> Result<Vec<SessionSummary>,
     let mut rows = stmt.query([])?;
     let mut sessions = Vec::new();
     while let Some(row) = rows.next()? {
-        let session = load_session_summary(conn, &row)?;
+        let session = load_session_summary(conn, row)?;
         sessions.push(session);
     }
     Ok(sessions)
@@ -648,7 +650,6 @@ pub fn init_default_db() -> Result<rusqlite::Connection, PersistenceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn create_test_checkpoint() -> Checkpoint {
         Checkpoint {

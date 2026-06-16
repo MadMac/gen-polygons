@@ -117,18 +117,20 @@ pub fn run_tui(db_conn: &mut rusqlite::Connection) -> io::Result<TuiAction> {
                             app.mode = Mode::NewSession;
                         }
                         KeyCode::Char('d') => {
-                            let selected = app.list_state.selected();
-                            if selected.is_some() && selected.unwrap() < app.sessions.len() {
-                                app.session_to_delete = Some(app.sessions[selected.unwrap()].id);
+                            if let Some(selected) = app.list_state.selected()
+                                && selected < app.sessions.len()
+                            {
+                                app.session_to_delete = Some(app.sessions[selected].id);
                                 app.mode = Mode::ConfirmDelete;
                             }
                         }
                         KeyCode::Enter => {
-                            let selected = app.list_state.selected();
-                            if selected.is_some() && selected.unwrap() < app.sessions.len() {
+                            if let Some(selected) = app.list_state.selected()
+                                && selected < app.sessions.len()
+                            {
                                 cleanup_terminal(&mut terminal)?;
                                 return Ok(TuiAction::ResumeSession {
-                                    id: app.sessions[selected.unwrap()].id,
+                                    id: app.sessions[selected].id,
                                 });
                             } else {
                                 app.mode = Mode::NewSession;
@@ -562,6 +564,27 @@ fn render_input_field<'a>(prefix: &'a str, value: &'a str, cursor_pos: usize, is
     Line::from(spans)
 }
 
+/// Helper to create a centered rectangle
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -604,24 +627,3 @@ fn render_input_field<'a>(prefix: &'a str, value: &'a str, cursor_pos: usize, is
             assert!(config.show_window);
         }
     }
-
-/// Helper to create a centered rectangle
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}

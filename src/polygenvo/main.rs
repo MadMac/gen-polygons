@@ -126,7 +126,7 @@ fn main() {
         
         // Load session if requested
         let initial_state = cli.load.map(|id| {
-            persistence::load_session(&mut db, id).expect("failed to load session")
+            persistence::load_session(&db, id).expect("failed to load session")
         });
 
         // Get or create session ID for saving
@@ -157,7 +157,7 @@ fn main() {
         // TUI mode - run the TUI to select or create a session
         match tui::run_tui(&mut db) {
             Ok(tui::TuiAction::ResumeSession { id }) => {
-                let checkpoint = persistence::load_session(&mut db, id).expect("failed to load session");
+                let checkpoint = persistence::load_session(&db, id).expect("failed to load session");
                 let goal = persistence::create_goal_image_from_checkpoint(&checkpoint);
                 let session_label = checkpoint.label.clone();
                 (Some(id), Some(checkpoint), session_label, goal, None)
@@ -236,7 +236,14 @@ fn main() {
         .as_mut()
         .map(|w| &mut w.observer as &mut dyn es::StepObserver);
     
-    let result = es::run_es(device, queue, goal, cfg, observer, Some(&mut db), session_id, session_label);
+    let result = es::run_es(
+        device, queue, goal, cfg, observer,
+        es::PersistenceConfig {
+            db_conn: Some(&mut db),
+            session_id,
+            session_label,
+        }
+    );
     println!(
         "Done. Initial fitness: {}, final fitness: {}, steps: {}",
         result.initial_fitness, result.final_fitness, result.steps_run

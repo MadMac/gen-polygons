@@ -344,42 +344,45 @@ fn snapshot_if(
     }
 }
 
-/// Extract the current ES state into a Checkpoint for saving.
-fn extract_state(
-    current: &[Vertex],
+/// Parameters for extracting state into a Checkpoint
+struct ExtractStateParams<'a> {
+    current: &'a [Vertex],
     current_fitness: usize,
     initial_fitness: usize,
     step: u64,
     improvements_total: u64,
-    schedule: &PhaseSchedule,
-    sigma: &OneFifthRule,
-    goal: &GoalImage,
+    schedule: &'a PhaseSchedule,
+    sigma: &'a OneFifthRule,
+    goal: &'a GoalImage,
     label: Option<String>,
-) -> persistence::Checkpoint {
+}
+
+/// Extract the current ES state into a Checkpoint for saving.
+fn extract_state(params: ExtractStateParams) -> persistence::Checkpoint {
     persistence::Checkpoint {
         session_id: None,
-        label,
-        goal_width: goal.pixels.width(),
-        goal_height: goal.pixels.height(),
-        goal_pixels: goal.pixels.to_vec(),
-        current_genome: current.to_vec(),
-        current_fitness: current_fitness as i64,
-        initial_fitness: initial_fitness as i64,
-        steps_run: step,
-        improvements_total,
-        phase_idx: schedule.idx,
-        phase_step: schedule.phase_step,
-        schedule_accepts: schedule.accepts,
-        sigma_pos: sigma.sigmas.pos,
-        sigma_col: sigma.sigmas.col,
-        sigma_grad: sigma.sigmas.grad,
-        window_steps: sigma.window_steps,
-        pos_gen: sigma.pos_gen,
-        pos_better: sigma.pos_better,
-        col_gen: sigma.col_gen,
-        col_better: sigma.col_better,
-        grad_gen: sigma.grad_gen,
-        grad_better: sigma.grad_better,
+        label: params.label,
+        goal_width: params.goal.pixels.width(),
+        goal_height: params.goal.pixels.height(),
+        goal_pixels: params.goal.pixels.to_vec(),
+        current_genome: params.current.to_vec(),
+        current_fitness: params.current_fitness as i64,
+        initial_fitness: params.initial_fitness as i64,
+        steps_run: params.step,
+        improvements_total: params.improvements_total,
+        phase_idx: params.schedule.idx,
+        phase_step: params.schedule.phase_step,
+        schedule_accepts: params.schedule.accepts,
+        sigma_pos: params.sigma.sigmas.pos,
+        sigma_col: params.sigma.sigmas.col,
+        sigma_grad: params.sigma.sigmas.grad,
+        window_steps: params.sigma.window_steps,
+        pos_gen: params.sigma.pos_gen,
+        pos_better: params.sigma.pos_better,
+        col_gen: params.sigma.col_gen,
+        col_better: params.sigma.col_better,
+        grad_gen: params.sigma.grad_gen,
+        grad_better: params.sigma.grad_better,
     }
 }
 
@@ -425,22 +428,29 @@ fn init_from_checkpoint(
     (schedule, sigma, current, current_fitness, parent_error_grid)
 }
 
+/// Persistence configuration for run_es
+pub(crate) struct PersistenceConfig<'a> {
+    pub db_conn: Option<&'a mut rusqlite::Connection>,
+    pub session_id: Option<i64>,
+    pub session_label: Option<String>,
+}
+
 pub(crate) fn run_es(
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     goal: GoalImage,
     cfg: EsConfig,
-    mut observer: Option<&mut dyn StepObserver>,
-    mut db_conn: Option<&mut rusqlite::Connection>,
-    session_id: Option<i64>,
-    session_label: Option<String>,
+    observer: Option<&mut dyn StepObserver>,
+    persistence: PersistenceConfig,
 ) -> EsResult {
     let pyramid = build_pyramid(&device, &queue, &goal);
     let full_res = pyramid.len() - 1; // index of full-resolution level (for snapshots)
 
-    // Extract db_conn, session_id, and session_label for use in the loop
+    // Extract persistence config for use in the loop
     // For checkpoint saving, we need a mutable reference to the connection
     // and the session_id. We'll handle them separately to avoid move issues.
+    let PersistenceConfig { mut db_conn, session_id, session_label } = persistence;
+    let mut observer = observer;
     let session_id_for_checkpoint = session_id;
     let session_label_for_checkpoint = session_label;
 
@@ -571,21 +581,24 @@ pub(crate) fn run_es(
                 && improvements_total != last_checkpoint_improvement
             {
                 // Save checkpoint if we have both a database connection and session ID
-                if db_conn.is_some() && session_id_for_checkpoint.is_some() {
-                    // Use as_mut to get mutable access without moving
-                    if let Some(db) = db_conn.as_mut() {
-                        let mut checkpoint = extract_state(
-                            &current, current_fitness, initial_fitness, step,
-                            improvements_total, &schedule, &sigma, &goal,
-                            session_label_for_checkpoint.clone()
-                        );
-                        checkpoint.session_id = session_id_for_checkpoint;
-                        if let Err(e) = persistence::save_session(db, &checkpoint) {
-                            log::warn!("Failed to save checkpoint: {}", e);
-                        } else {
-                            last_checkpoint_improvement = improvements_total;
-                            log::info!("Checkpoint saved at improvement {}", improvements_total);
-                        }
+                if let (Some(db), Some(sid)) = (db_conn.as_mut(), session_id_for_checkpoint) {
+                    let mut checkpoint = extract_state(ExtractStateParams {
+                        current: &current,
+                        current_fitness,
+                        initial_fitness,
+                        step,
+                        improvements_total,
+                        schedule: &schedule,
+                        sigma: &sigma,
+                        goal: &goal,
+                        label: session_label_for_checkpoint.clone(),
+                    });
+                    checkpoint.session_id = Some(sid);
+                    if let Err(e) = persistence::save_session(db, &checkpoint) {
+                        log::warn!("Failed to save checkpoint: {}", e);
+                    } else {
+                        last_checkpoint_improvement = improvements_total;
+                        log::info!("Checkpoint saved at improvement {}", improvements_total);
                     }
                 }
             }
@@ -697,21 +710,25 @@ pub(crate) fn run_es(
     snapshot_if(&snapshot_dir, &pyramid[full_res], &current, "final.png");
 
     // Save final checkpoint if DB is available
-    if db_conn.is_some() && session_id_for_checkpoint.is_some() {
-        if let (Some(db), Some(sid)) = (db_conn.as_mut(), session_id_for_checkpoint) {
-            let checkpoint = extract_state(
-                &current, current_fitness, initial_fitness, step,
-                improvements_total, &schedule, &sigma, &goal,
-                session_label_for_checkpoint.clone()
-            );
-            // Set the session ID so we update the existing session
-            let mut checkpoint_with_id = checkpoint;
-            checkpoint_with_id.session_id = Some(sid);
-            if let Err(e) = persistence::save_session(db, &checkpoint_with_id) {
-                log::warn!("Failed to save final checkpoint: {}", e);
-            } else {
-                log::info!("Final checkpoint saved");
-            }
+    if let (Some(db), Some(sid)) = (db_conn.as_mut(), session_id_for_checkpoint) {
+        let checkpoint = extract_state(ExtractStateParams {
+            current: &current,
+            current_fitness,
+            initial_fitness,
+            step,
+            improvements_total,
+            schedule: &schedule,
+            sigma: &sigma,
+            goal: &goal,
+            label: session_label_for_checkpoint.clone(),
+        });
+        // Set the session ID so we update the existing session
+        let mut checkpoint_with_id = checkpoint;
+        checkpoint_with_id.session_id = Some(sid);
+        if let Err(e) = persistence::save_session(db, &checkpoint_with_id) {
+            log::warn!("Failed to save final checkpoint: {}", e);
+        } else {
+            log::info!("Final checkpoint saved");
         }
     }
 
@@ -867,9 +884,11 @@ mod tests {
                 initial_state: None,
             },
             None,
-            None,
-            None,
-            None,
+            PersistenceConfig {
+                db_conn: None,
+                session_id: None,
+                session_label: None,
+            },
         );
         assert!(
             result.steps_run > 0,
@@ -928,7 +947,14 @@ mod tests {
             checkpoint_interval: None,
             initial_state: None,
         };
-        let base = run_es(device.clone(), queue.clone(), goal.clone(), cfg, None, None, None, None);
+        let base = run_es(
+            device.clone(), queue.clone(), goal.clone(), cfg, None,
+            PersistenceConfig {
+                db_conn: None,
+                session_id: None,
+                session_label: None,
+            }
+        );
         let f_base = base.final_fitness;
         let mut g = base.final_genome;
         println!("PROBE baseline: {} tris, hard fitness {f_base}", g.len() / 3);
