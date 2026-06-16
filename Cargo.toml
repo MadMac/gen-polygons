@@ -7,24 +7,24 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-image = "0.25"
-env_logger = "0.11"
-log = "0.4"
-wgpu = "29"
-futures = "0.3"
-bytemuck = { version = "1", features = [ "derive" ] }
-rand = "0.10"
-ctrlc = "3"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-winit = "0.30"
-rusqlite = { version = "0.31", features = ["bundled"] }
-thiserror = "1"
-ratatui = "0.27"
-crossterm = "0.29"
-tui-input = "0.15"
+image = "^0.25.10"
+env_logger = "^0.11.10"
+log = "^0.4.32"
+wgpu = "^29.0.3"
+futures = "^0.3.32"
+bytemuck = { version = "^1.25.0", features = [ "derive" ] }
+rand = "^0.10.1"
+ctrlc = "^3.5.2"
+chrono = { version = "^0.4.45", default-features = false, features = ["clock"] }
+winit = "^0.30"
+rusqlite = { version = "^0.40.1", features = ["bundled"] }
+thiserror = "^2.0.18"
+ratatui = "^0.30.1"
+crossterm = "^0.29.0"
+tui-input = "^0.15.3"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "^3.27.0"
 
 [[bin]]
 name = "polygenvo"

@@ -286,7 +286,7 @@ impl ActiveField {
 
 /// UI rendering
 fn ui(f: &mut ratatui::prelude::Frame, app: &mut App) {
-    let size = f.size();
+    let size = f.area();
 
     match app.mode {
         Mode::SessionSelect => {

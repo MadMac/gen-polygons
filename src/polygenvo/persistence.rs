@@ -584,8 +584,8 @@ fn load_session_summary(_conn: &rusqlite::Connection, row: &rusqlite::Row) -> Re
             let n_vertices: i64 = row.get(7)?;
             (n_vertices / 3) as usize
         },
-        phase_index: row.get(8)?,
-        steps_run: row.get(9)?,
+        phase_index: row.get::<_, i64>(8)? as usize,
+        steps_run: row.get::<_, i64>(9)? as u64,
     })
 }
 
